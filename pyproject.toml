@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snakeplusplus"
+version = "0.1.0"
+description = "Snake++: modular, object-oriented pipelines on top of Snakemake"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "R. Bakker" }]
+dependencies = [
+    "snakemake>=9",
+    "pydantic>=2",
+    "beartype>=0.18",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+snakeplusplus-doc = "snakeplusplus.doc:main"
+
+[project.urls]
+Repository = "https://github.com/rbakker/snakeplusplus"
+
+[tool.setuptools.package-data]
+snakeplusplus = ["*.smk"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

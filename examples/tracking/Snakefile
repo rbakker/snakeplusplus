@@ -1,0 +1,79 @@
+# core python imports
+import os
+from os import path as op
+import json
+from pathlib import Path
+
+import snakeplusplus
+from snakeplusplus import SnakeRule, SnakeCheckpoint, TargetRule, JobResult as Result, Field, Fixed, Json
+
+#####################
+# --- Configure --- #
+#####################
+
+project_root = os.getcwd()
+pathvars:
+    logs = op.join(project_root,'logs'),
+    results = op.join(project_root,'results'),
+    resources = op.join(project_root,'resources')
+
+config.setdefault('tracking_root', '../Data/tracking')
+
+# set default parameters as defined in a config file (if any)
+snakeplusplus.configure(workflow.pathvars, config.get('params',{}), retry_failed=config.get('retry_failed', True))
+
+
+#####################
+# --- Iterables --- #
+#####################
+
+def allSubjects(wildcards):
+    for sub in ['1','2']:
+        yield dict(subject=sub)
+
+
+#####################
+# --- Utilities --- #
+#####################
+
+
+########################
+# --- Define rules --- #
+########################
+
+class TrackingModule(SnakeRule):
+    class WildcardModel(Fixed):
+        subject: str = Field('sub-{}', description="subject")
+
+    class InputModel(Fixed):
+        FOD: Path = Field(description='FOD file')
+        atlas_dir: Path = Field(description='ATLAS')
+
+    class OutputModel(Fixed):
+        tckout: Path = Field('sub-{subject}_tractogram.tck', description="Tracking result")
+
+    class ParamModel(Fixed):
+        mode: str = Field('stefan',description='mode')
+
+    def run(self,job,input,output,params,wildcards):
+        print('Execute the tracking here. A log file is automatically created.')
+        print(params)
+
+
+#########################
+# --- Connect Rules --- #
+#########################
+
+tracking_module = TrackingModule(params=dict(mode='CSD')).set_input(
+    FOD = op.join(config['tracking_root'],'sub-{subject}','ses-pre','FOD.mif'),
+    atlas_dir = op.join(config['tracking_root'],'sub-{subject}','ses-pre','atlas')
+)
+
+runall = TargetRule().set_input(
+    _ = tracking_module.foreach(allSubjects)
+)
+
+
+# turn the SnakeRule objects above into Snakemake rules
+include: snakeplusplus.SNAKEFILE
+snakeplusplus.build(locals(), verbose=True)

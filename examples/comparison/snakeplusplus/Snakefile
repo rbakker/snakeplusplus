@@ -1,0 +1,72 @@
+# The Hello pipeline with Snake++ (snakeplusplus).
+# Run from this folder: snakemake -c1
+import csv
+from os import path as op
+from pathlib import Path
+
+import snakeplusplus
+from snakeplusplus import SnakeRule, TargetRule, Field, Fixed
+
+pathvars:
+    logs = op.abspath('logs'),
+    results = op.abspath('results')
+
+snakeplusplus.configure(workflow.pathvars, config.get('params', {}))
+
+
+def greetings(wildcards):
+    with open(config.get('input', '../greetings.csv')) as fp:
+        for row in csv.reader(fp):
+            yield dict(greeting=row[0])
+
+
+class GreetingRule(SnakeRule):
+    """Base class for rules that run once per greeting."""
+    class WildcardModel(Fixed):
+        greeting: str = Field('{}')
+
+
+class SayHello(GreetingRule):
+    class OutputModel(Fixed):
+        text: Path = Field('{greeting}-output.txt')
+
+    def run(self, job, input, output, params, wildcards):
+        job.shell(f"echo '{wildcards.greeting}' > {output.text}")
+
+
+class ConvertToUpper(GreetingRule):
+    class InputModel(Fixed):
+        text: Path
+
+    class OutputModel(Fixed):
+        upper: Path = Field('UPPER-{greeting}-output.txt')
+
+    def run(self, job, input, output, params, wildcards):
+        job.shell(f"tr '[a-z]' '[A-Z]' < {input.text} > {output.upper}")
+
+
+class CollectGreetings(SnakeRule):
+    class InputModel(Fixed):
+        files: list[Path]
+
+    class OutputModel(Fixed):
+        collected: Path = Field('COLLECTED-output.txt')
+        # note: a field cannot be called `report`, which is a Snakemake keyword
+        summary: Path = Field('report.txt')
+
+    def run(self, job, input, output, params, wildcards):
+        job.shell(f"cat {' '.join(input.files)} > {output.collected}")
+        job.shell(f"echo 'There were {len(input.files)} greetings in this batch.' > {output.summary}")
+
+
+say_hello = SayHello()
+convert_to_upper = ConvertToUpper().set_input(text=say_hello.get_output('text'))
+collect_greetings = CollectGreetings().set_input(
+    files=convert_to_upper.foreach(greetings).get_output('upper')
+)
+runall = TargetRule().set_input(_=collect_greetings)
+
+
+# turn the SnakeRule objects above into Snakemake rules
+include: snakeplusplus.SNAKEFILE
+snakeplusplus.build(locals())

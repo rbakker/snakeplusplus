@@ -1,0 +1,46 @@
+# The Hello pipeline in plain Snakemake.
+# Run from this folder: snakemake -c1
+import csv
+
+GREETINGS = [row[0] for row in csv.reader(open(config.get("input", "../greetings.csv")))]
+
+# without this, "UPPER-Hello-output.txt" would also match "{greeting}-output.txt"
+wildcard_constraints:
+    greeting="[^-/]+",
+
+
+rule all:
+    input:
+        "results/COLLECTED-output.txt",
+        "results/report.txt",
+
+
+rule say_hello:
+    output:
+        "results/{greeting}-output.txt",
+    shell:
+        "echo '{wildcards.greeting}' > {output}"
+
+
+rule convert_to_upper:
+    input:
+        "results/{greeting}-output.txt",
+    output:
+        "results/UPPER-{greeting}-output.txt",
+    shell:
+        "tr '[a-z]' '[A-Z]' < {input} > {output}"
+
+
+rule collect_greetings:
+    input:
+        expand("results/UPPER-{greeting}-output.txt", greeting=GREETINGS),
+    output:
+        collected="results/COLLECTED-output.txt",
+        report="results/report.txt",
+    params:
+        n=len(GREETINGS),
+    shell:
+        """
+        cat {input} > {output.collected}
+        echo 'There were {params.n} greetings in this batch.' > {output.report}
+        """
