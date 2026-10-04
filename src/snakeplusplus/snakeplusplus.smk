@@ -1,12 +1,8 @@
-# Snakemake part of snakeplusplus. End a Snakefile with these two lines:
-#
-#     include: snakeplusplus.SNAKEFILE
-#     snakeplusplus.build(locals())
+# Snakemake part of snakeplusplus, included by snakeplusplus.build(locals()) at the end of a Snakefile.
 #
 # This file defines inject_rule(), which build() uses to turn every SnakeRule object in the
 # Snakefile into a Snakemake rule. It must be a Snakefile (not Python), because rule and
-# checkpoint definitions need Snakemake's syntax. build() must be called from the Snakefile
-# itself, not from here: Snakemake discards a default target that is set in an included file.
+# checkpoint definitions need Snakemake's syntax.
 
 
 def checkpoint_magic(fn):
@@ -19,6 +15,7 @@ def inject_rule(r):
             input: r.input
             params: **r.params
             output: r.output
+            wildcard_constraints: **r.wildcard_constraints
             threads: r.threads
             default_target: r.default_target
             conda: r.conda
@@ -30,6 +27,7 @@ def inject_rule(r):
             input: r.input
             params: **r.params
             output: r.output
+            wildcard_constraints: **r.wildcard_constraints
             threads: r.threads
             default_target: r.default_target
             conda: r.conda

@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 import snakeplusplus
-from snakeplusplus import SnakeRule, SnakeCheckpoint, TargetRule, JobResult as Result, Field, Fixed, Json
+from snakeplusplus import SnakeRule, SnakeCheckpoint, target, JobResult as Result, Field, Fixed, Json
 
 #####################
 # --- Configure --- #
@@ -27,7 +27,7 @@ snakeplusplus.configure(workflow.pathvars, config.get('params',{}), retry_failed
 # --- Iterables --- #
 #####################
 
-def allSubjects(wildcards):
+def all_subjects(wildcards):
     for sub in ['1','2']:
         yield dict(subject=sub)
 
@@ -42,8 +42,7 @@ def allSubjects(wildcards):
 ########################
 
 class TrackingModule(SnakeRule):
-    class WildcardModel(Fixed):
-        subject: str = Field('sub-{}', description="subject")
+    result_template = 'sub-{subject}'
 
     class InputModel(Fixed):
         FOD: Path = Field(description='FOD file')
@@ -58,22 +57,20 @@ class TrackingModule(SnakeRule):
     def run(self,job,input,output,params,wildcards):
         print('Execute the tracking here. A log file is automatically created.')
         print(params)
+        Path(output.tckout).touch()  # placeholder: every output in OutputModel must be created
 
 
 #########################
 # --- Connect Rules --- #
 #########################
 
-tracking_module = TrackingModule(params=dict(mode='CSD')).set_input(
+tracking_module = TrackingModule(mode='CSD').set_input(
     FOD = op.join(config['tracking_root'],'sub-{subject}','ses-pre','FOD.mif'),
     atlas_dir = op.join(config['tracking_root'],'sub-{subject}','ses-pre','atlas')
 )
 
-runall = TargetRule().set_input(
-    _ = tracking_module.foreach(allSubjects)
-)
+runall = target(tracking_module.foreach(all_subjects))
 
 
 # turn the SnakeRule objects above into Snakemake rules
-include: snakeplusplus.SNAKEFILE
 snakeplusplus.build(locals(), verbose=True)

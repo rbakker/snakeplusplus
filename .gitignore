@@ -1,0 +1,16 @@
+__pycache__/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.snakemake/
+logs/
+results/
+# example runs
+examples/**/work/
+examples/**/.nextflow*
+examples/**/cache/
+
+# code update zip files, not committed
+archive/
+site/

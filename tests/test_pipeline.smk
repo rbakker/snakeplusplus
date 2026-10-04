@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import snakeplusplus
-from snakeplusplus import SnakeRule, SnakeCheckpoint, TargetRule, JobResult, Field, Fixed
+from snakeplusplus import SnakeRule, SnakeCheckpoint, target, JobResult, JobError, Field, Fixed
 
 project_root = os.getcwd()
 pathvars:
@@ -34,8 +34,7 @@ class MakeSubjectList(SnakeCheckpoint):
 
 
 class Measure(SnakeRule):
-    class WildcardModel(Fixed):
-        subject: str = Field('sub-{}')
+    result_template = 'sub-{subject}'
 
     class OutputModel(Fixed):
         value: Path = Field('value.txt')
@@ -44,6 +43,9 @@ class Measure(SnakeRule):
         fail_on: list[str] = Field([])
 
     def run(self, job, input, output, params, wildcards):
+        if op.exists('snapshot_logs'):  # test hook: what does the log folder look like during the run?
+            with open(f'snapshot_{wildcards.subject}.json', 'w') as fp:
+                json.dump(sorted(os.listdir(op.dirname(job.log_file))), fp)
         if wildcards.subject in params.fail_on or op.exists(f'fail_{wildcards.subject}'):
             raise ValueError(f'measurement failed for subject {wildcards.subject}')
         with open(output.value, 'w') as fp:
@@ -61,8 +63,7 @@ def tag_subject(path: Path, wildcards) -> str:
 
 
 class Double(SnakeRule):
-    class WildcardModel(Fixed):
-        subject: str = Field('sub-{}')
+    result_template = 'sub-{subject}'
 
     class InputModel(Fixed):
         value: int
@@ -77,28 +78,28 @@ class Double(SnakeRule):
 
 
 def subjects_from_checkpoint(wildcards):
-    res = JobResult.fromCheckpoint(checkpoints.make_subject_list, wildcards)
+    res = JobResult.from_checkpoint(checkpoints.make_subject_list, wildcards)
     for s in json.load(open(res.subjects)):
         yield dict(subject=s)
 
 
 class TolerantSummary(SnakeRule):
-    allow_failed_inputs = {'results'}
-
     class InputModel(Fixed):
-        results: list[Path]
+        results: list[Path | JobError]  # a failed subject arrives as JobError
 
     class OutputModel(Fixed):
         summary: Path = Field('summary.json')
 
     def run(self, job, input, output, params, wildcards):
-        ok = [json.load(open(r)) for r in input.results if r is not None]
+        ok = [json.load(open(r)) for r in input.results if not isinstance(r, JobError)]
+        failed = [r for r in input.results if isinstance(r, JobError)]
         with open(output.summary, 'w') as fp:
-            json.dump({'ok': ok, 'failed': job.failed_inputs}, fp, indent=2)
+            json.dump({'ok': ok, 'failed': [str(e) for e in failed]}, fp, indent=2)
 
 
 class StrictSummary(TolerantSummary):
-    allow_failed_inputs = False
+    class InputModel(Fixed):
+        results: list[Path]  # a failed subject makes this job fail
 
 
 # --- graph --- #
@@ -115,12 +116,8 @@ tolerant_summary = TolerantSummary().set_input(
 strict_summary = StrictSummary().set_input(
     results=double.foreach(subjects_from_checkpoint).get_output('result'),
 )
-runall = TargetRule().set_input(
-    a=tolerant_summary,
-    b=strict_summary,
-)
+runall = target(tolerant_summary, strict_summary)
 
 
 # turn the SnakeRule objects above into Snakemake rules
-include: snakeplusplus.SNAKEFILE
 snakeplusplus.build(locals())

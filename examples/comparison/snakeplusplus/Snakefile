@@ -5,7 +5,7 @@ from os import path as op
 from pathlib import Path
 
 import snakeplusplus
-from snakeplusplus import SnakeRule, TargetRule, Field, Fixed
+from snakeplusplus import SnakeRule, target, Field, Fixed
 
 pathvars:
     logs = op.abspath('logs'),
@@ -22,8 +22,7 @@ def greetings(wildcards):
 
 class GreetingRule(SnakeRule):
     """Base class for rules that run once per greeting."""
-    class WildcardModel(Fixed):
-        greeting: str = Field('{}')
+    result_template = '{greeting}'
 
 
 class SayHello(GreetingRule):
@@ -55,7 +54,7 @@ class CollectGreetings(SnakeRule):
         summary: Path = Field('report.txt')
 
     def run(self, job, input, output, params, wildcards):
-        job.shell(f"cat {' '.join(input.files)} > {output.collected}")
+        job.shell(f"cat {' '.join(map(str, input.files))} > {output.collected}")
         job.shell(f"echo 'There were {len(input.files)} greetings in this batch.' > {output.summary}")
 
 
@@ -64,9 +63,8 @@ convert_to_upper = ConvertToUpper().set_input(text=say_hello.get_output('text'))
 collect_greetings = CollectGreetings().set_input(
     files=convert_to_upper.foreach(greetings).get_output('upper')
 )
-runall = TargetRule().set_input(_=collect_greetings)
+runall = target(collect_greetings)
 
 
 # turn the SnakeRule objects above into Snakemake rules
-include: snakeplusplus.SNAKEFILE
 snakeplusplus.build(locals())

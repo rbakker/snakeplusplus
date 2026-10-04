@@ -17,9 +17,9 @@ decide which tool fits your project.
 | **Type checking** | Pydantic models, checked when the Snakefile is parsed | None | Optional static types (typed processes, 26.04+) | Type annotations, checked when the workflow is built |
 | **Looping over subjects** | `rule.foreach(...)` | Wildcards + `expand()` | Channels; every item flows through | `split()` / `combine()` |
 | **DAG that depends on results** | Checkpoints, wrapped by `foreach` | Checkpoints | Native (dataflow) | Native (lazy evaluation) |
-| **When a job fails** | Never stops the run. Error goes to `.error`; downstream jobs fail with the root cause, or continue via `allow_failed_inputs` | Stops the run; `--keep-going` continues independent jobs | Configurable per process: `terminate` (default), `finish`, `ignore`, `retry` | Raises an error; completed tasks stay cached |
+| **When a job fails** | Never stops the run. Error goes to `.error`; downstream jobs fail with the root cause, or receive it as a `JobError` value where their input type admits it | Stops the run; `--keep-going` continues independent jobs | Configurable per process: `terminate` (default), `finish`, `ignore`, `retry` | Raises an error; completed tasks stay cached |
 | **Deciding what to rerun** | Snakemake's own logic applied to the log files: changed params, newer upstream logs; failed jobs are retried | File timestamps, plus changed params, code or inputs | Hash of each task's inputs and script (`-resume`) | Hash of each task's inputs (cache directory) |
-| **Monitoring a run** | Built in: one file per job in the log folder, named by state: `.running`, `.log`, `.error`, `.stale`. A file browser or `ls logs/*.error` is the dashboard | Terminal output and one Snakemake log per run; per-job logs if you declare them | Terminal output, `nextflow log`, execution reports, and Seqera Platform (web) | Terminal output; results and errors in the cache directories |
+| **Monitoring a run** | Built in: one file per job in the log folder, named by state: `.queued`, `.running`, `.log`, `.error`, `.stale`. A file browser or `ls logs/*.error` is the dashboard | Terminal output and one Snakemake log per run; per-job logs if you declare them | Terminal output, `nextflow log`, execution reports, and Seqera Platform (web) | Terminal output; results and errors in the cache directories |
 | **Rerunning one step by hand** | Delete its log file | Delete its output files, or `--forcerun` | Change it and use `-resume`, or clear its work dir | Delete its cache directory |
 | **Where results go** | One folder per rule and wildcard set, derived automatically | Wherever your output patterns say | Isolated work dirs; you publish selected outputs | Hash-named cache dirs |
 | **Cluster / cloud** | Everything Snakemake supports | Executor plugins (SLURM, cloud, …) | Many executors, strong on cloud | Workers (SLURM, SGE, Dask, …) |
@@ -44,7 +44,7 @@ produce the same result.
 Snake++ is the longest because every rule declares its wildcards, inputs and outputs as typed
 models. That is also what gives it build-time type checks, and self-describing rules for the
 generated documentation. Rules that share wildcards can inherit them from a common base class
-(`GreetingRule` here). The Snakemake-specific part is two lines at the end.
+(`GreetingRule` here). The Snakemake-specific part is one line at the end.
 
 === "Snake++"
 
@@ -56,7 +56,7 @@ generated documentation. Rules that share wildcards can inherit them from a comm
     from pathlib import Path
 
     import snakeplusplus
-    from snakeplusplus import SnakeRule, TargetRule, Field, Fixed
+    from snakeplusplus import SnakeRule, target, Field, Fixed
 
     pathvars:
         logs = op.abspath('logs'),
@@ -73,8 +73,7 @@ generated documentation. Rules that share wildcards can inherit them from a comm
 
     class GreetingRule(SnakeRule):
         """Base class for rules that run once per greeting."""
-        class WildcardModel(Fixed):
-            greeting: str = Field('{}')
+        result_template = '{greeting}'
 
 
     class SayHello(GreetingRule):
@@ -106,7 +105,7 @@ generated documentation. Rules that share wildcards can inherit them from a comm
             summary: Path = Field('report.txt')
 
         def run(self, job, input, output, params, wildcards):
-            job.shell(f"cat {' '.join(input.files)} > {output.collected}")
+            job.shell(f"cat {' '.join(map(str, input.files))} > {output.collected}")
             job.shell(f"echo 'There were {len(input.files)} greetings in this batch.' > {output.summary}")
 
 
@@ -115,11 +114,10 @@ generated documentation. Rules that share wildcards can inherit them from a comm
     collect_greetings = CollectGreetings().set_input(
         files=convert_to_upper.foreach(greetings).get_output('upper')
     )
-    runall = TargetRule().set_input(_=collect_greetings)
+    runall = target(collect_greetings)
 
 
     # turn the SnakeRule objects above into Snakemake rules
-    include: snakeplusplus.SNAKEFILE
     snakeplusplus.build(locals())
     ```
 
@@ -322,7 +320,7 @@ expressive. It has a smaller ecosystem than the other two, and version 1.0 is st
 - you want steps to be reusable, documented classes with typed inputs and outputs, and you want
   wiring mistakes caught before anything runs;
 - you want to see the state of a run at a glance: the log folder has one file per job, and its
-  extension (`.running`, `.log`, `.error`, `.stale`) tells you where each job is. Deleting a log
+  extension (`.queued`, `.running`, `.log`, `.error`, `.stale`) tells you where each job is. Deleting a log
   file reruns exactly that job, plus what depends on it;
 - you already run Snakemake on your cluster and do not want to switch schedulers.
 

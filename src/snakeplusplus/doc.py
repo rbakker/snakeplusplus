@@ -17,7 +17,7 @@ from pathlib import Path
 from pydantic_core import PydanticUndefined
 
 import snakeplusplus
-from snakeplusplus import SnakeRule, JobLoop, OutputPromise, _is_incomplete_checkpoint, _is_input_function
+from snakeplusplus import SnakeRule, TargetRule, JobLoop, OutputPromise, _is_incomplete_checkpoint, _is_input_function
 
 
 def load_pipeline(snakefile, config=None, configfiles=None, workdir=None):
@@ -38,7 +38,7 @@ def load_pipeline(snakefile, config=None, configfiles=None, workdir=None):
         )
         snakeplusplus._read_only = True
         workflow_api._workflow  # parses the Snakefile, which calls snakeplusplus.build()
-    return snakeplusplus.get_builder()
+    return snakeplusplus._get_builder()
 
 
 def _esc(text):
@@ -60,11 +60,11 @@ def _loop_label(loop):
     except Exception as e:
         # IncompleteCheckpointException: depends on a checkpoint; other errors: depends on
         # parent wildcards, or on files that do not exist yet.
-        wc = '/'.join(loop.rule.WildcardModel.model_fields) or 'loop'
+        wc = '/'.join(loop.rule._wildcard_names()) or 'loop'
         if _is_incomplete_checkpoint(e):
             return wc, 'from checkpoint', getattr(getattr(e, 'rule', None), 'name', None)
         return wc, 'dynamic', None
-    wc = '/'.join(members[0].keys()) if members else '/'.join(loop.rule.WildcardModel.model_fields)
+    wc = '/'.join(members[0].keys()) if members else '/'.join(loop.rule._wildcard_names())
     return wc, f'{len(members)} items', None
 
 
@@ -92,14 +92,14 @@ def mermaid_graph(rules):
     for name, rule in rules.items():
         cls = type(rule)
         node_id = ids[id(rule)]
-        w_keys = list(rule.WildcardModel.model_fields)
+        w_keys = rule._wildcard_names()
         w_text = f"<br/><small><font color='blue'>{_esc('/'.join(w_keys))}</font></small>" if w_keys else ''
         kind = '<br/><small><i>checkpoint</i></small>' if rule.is_checkpoint else ''
         label = (f"<div style='border-bottom: 1px solid black'><b>{_esc(name)}</b></div>"
-                 f"{_esc(cls.__name__)}{kind}{w_text}")
+                 f"{'<i>target</i>' if isinstance(rule, TargetRule) else _esc(cls.__name__)}{kind}{w_text}")
         if rule.is_checkpoint:
             lines.append(f'    {node_id}{{{{"{label}"}}}}:::checkpointStyle')
-        elif rule.default_target:
+        elif isinstance(rule, TargetRule):
             lines.append(f'    {node_id}(["{label}"]):::targetStyle')
         else:
             lines.append(f'    {node_id}["{label}"]')
@@ -113,7 +113,7 @@ def mermaid_graph(rules):
             if id(source) not in ids:
                 continue  # rule not assigned to a variable in the Snakefile
             source_id = ids[id(source)]
-            edge_label = val.key or (key if key != '_' and not loop else '')
+            edge_label = val.key or (key if not key.startswith('_') and not loop else '')
             if val.parser is not None:
                 edge_label += f' ⟶ {getattr(val.parser, "__name__", "parser")}()'
             edge = f'|"{_esc(edge_label)}"|' if edge_label else ''
@@ -124,7 +124,8 @@ def mermaid_graph(rules):
                              f"<font color='blue'><small>{_esc(wc)}<br/>{_esc(count)}</small></font>")
                 lines.append(f'    {agg_id}(("{agg_label}")):::loopStyle')
                 lines.append(f'    {source_id} -->{edge} {agg_id}')
-                lines.append(f'    {agg_id} ==>|"{_esc(key)}"| {node_id}')
+                into = f'|"{_esc(key)}"|' if not key.startswith('_') else ''
+                lines.append(f'    {agg_id} ==>{into} {node_id}')
                 if checkpoint in ids_by_name:
                     lines.append(f'    {ids_by_name[checkpoint]} -.->|"defines items"| {agg_id}')
             else:
@@ -158,22 +159,20 @@ def _connection(val):
 
 def rule_card(name, rule):
     cls = type(rule)
-    kind = 'checkpoint' if rule.is_checkpoint else 'target' if rule.default_target else 'rule'
+    kind = 'checkpoint' if rule.is_checkpoint else 'target' if isinstance(rule, TargetRule) else 'rule'
     doc = (cls.__doc__ or '').strip()
     description = rule.description if rule.description != SnakeRule.description else doc
-    rows = (_field_rows('wildcard', rule.WildcardModel) + _field_rows('input', rule.InputModel, False)
+    wildcard_rows = [f"<tr><td>wildcard</td><td><code>{_esc(w)}</code></td><td><code>str</code></td>"
+                     f"<td></td><td></td></tr>" for w in rule._wildcard_names()]
+    rows = (wildcard_rows + _field_rows('input', rule.InputModel, False)
             + _field_rows('output', rule.OutputModel) + _field_rows('param', rule.ParamModel))
     inputs = ''.join(f"<li><code>{_esc(k)}</code> ← {_esc(_connection(v))}</li>" for k, v in rule.inputs.items())
     params = ''.join(f"<li><code>{_esc(k)}</code> = {_esc(repr(v))}</li>" for k, v in rule.params.items())
-    extra = []
-    if rule.allow_failed_inputs:
-        extra.append(f"allow_failed_inputs = {_esc(rule.allow_failed_inputs)}")
     return f"""
 <div class="rule-card" id="{_esc(name)}">
 <h3>{_esc(name)} <small>({_esc(cls.__name__)}, {kind})</small></h3>
 <p>{_esc(description)}</p>
-<p class="meta">log: <code>{_esc(rule.log_path())}</code><br/>results: <code>{_esc(rule.result_path())}</code>
-{''.join('<br/>' + e for e in extra)}</p>
+<p class="meta">log: <code>{_esc(rule.log_path())}</code><br/>results: <code>{_esc(rule.result_path())}</code></p>
 {f'<h4>Connected inputs</h4><ul>{inputs}</ul>' if inputs else ''}
 {f'<h4>Parameters set in this pipeline</h4><ul>{params}</ul>' if params else ''}
 <table>

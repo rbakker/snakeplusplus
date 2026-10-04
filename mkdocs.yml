@@ -1,0 +1,73 @@
+site_name: Snake++
+site_description: Modular, object-oriented pipelines on top of Snakemake
+repo_url: https://github.com/rbakker/snakeplusplus
+repo_name: rbakker/snakeplusplus
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.sections
+    - navigation.footer
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle: {icon: material/brightness-7, name: Dark mode}
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle: {icon: material/brightness-4, name: Light mode}
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.snippets:
+      base_path: ['.']
+      check_paths: true
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            docstring_options:
+              warn_missing_types: false
+            show_source: false
+            show_root_heading: true
+            show_root_full_path: false
+            members_order: source
+            heading_level: 3
+            merge_init_into_class: false
+
+nav:
+  - Home: index.md
+  - Tutorial: getting-started.md
+  - Concepts:
+      - Rules: concepts/rules.md
+      - Connecting rules: concepts/connecting.md
+      - Loops and checkpoints: concepts/loops-and-checkpoints.md
+      - Targets: concepts/targets.md
+      - Log files: concepts/log-files.md
+      - When jobs rerun: concepts/reruns.md
+      - Where errors go: concepts/errors.md
+  - How-to:
+      - Parameters from a config file: how-to/parameters.md
+      - Outputs that are not one file: how-to/outputs.md
+      - Run external commands: how-to/external-commands.md
+      - Continue when some jobs fail: how-to/failed-inputs.md
+      - Choose an input per job: how-to/inputs-per-job.md
+      - Temporary files: how-to/temporary-files.md
+      - Reuse costly results: how-to/reuse-results.md
+      - Document a pipeline: how-to/pipeline-documentation.md
+  - Comparison with other tools: comparison.md
+  - Limitations: limitations.md
+  - Reference: reference.md

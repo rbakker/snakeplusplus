@@ -1,4 +1,4 @@
-# Snake++ (`snakeplusplus`)
+# Snake++
 
 Modular, object-oriented pipelines on top of [Snakemake](https://snakemake.readthedocs.io).
 
@@ -60,13 +60,8 @@ snakeplusplus.build(locals())
 pip install snakeplusplus
 ```
 
-For development: `pip install -e ".[test]"`, then `pytest`.
+## Where to go next
 
-## Documentation of a pipeline
-
-```
-snakeplusplus-doc path/to/Snakefile -o docs/pipeline.html
-```
-
-generates an HTML overview of the pipeline: a diagram of the rules and how they are connected,
-and a reference of each rule's wildcards, inputs, outputs and parameters.
+- The [tutorial](getting-started.md) builds a small pipeline step by step.
+- [Concepts](concepts/rules.md) explains how rules, connections, log files and reruns work.
+- The [comparison](comparison.md) sets Snake++ next to Snakemake, Nextflow and Pydra.
