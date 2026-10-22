@@ -103,6 +103,83 @@ def format_elapsed(td):
     return str(td).split('.')[0]
 
 
+def blocked_paths(path, contents=False):
+    """Folders that stop the current user from creating, replacing or removing `path`: its folder
+    (or the nearest one that exists) must be writable. With `contents`, also every folder inside
+    `path`, for removing what is in it. Returns a list of folders, empty if nothing is blocked."""
+    blocked = []
+    parent = op.dirname(op.abspath(path.rstrip(op.sep) or path))
+    while parent and not op.exists(parent):
+        parent = op.dirname(parent)
+    if parent and not os.access(parent, os.W_OK | os.X_OK):
+        blocked.append(parent)
+    elif op.isfile(path) and not os.access(path, os.W_OK):
+        blocked.append(op.abspath(path))  # e.g. a tool that writes into an existing file
+    if contents and op.isdir(path) and not op.islink(path):
+        for root, dirs, _ in os.walk(path):
+            if not os.access(root, os.W_OK | os.X_OK):
+                blocked.append(op.abspath(root))
+                dirs[:] = []  # its subfolders cannot be emptied anyway
+            dirs[:] = [d for d in dirs if not op.islink(op.join(root, d))]
+    return blocked
+
+
+def _owner_text(path):
+    import pwd, grp, stat
+    st = os.stat(path)
+    try:
+        owner = pwd.getpwuid(st.st_uid).pw_name
+    except KeyError:
+        owner = str(st.st_uid)
+    try:
+        group = grp.getgrgid(st.st_gid).gr_name
+    except KeyError:
+        group = str(st.st_gid)
+    return owner, group, st.st_gid, stat.filemode(st.st_mode)
+
+
+def permission_advice(paths, intro):
+    """A message for folders (or files) the current user cannot write: who owns them, and what to do."""
+    import getpass
+    me = getpass.getuser()
+    my_groups = set(os.getgroups()) | {os.getegid()}
+    paths = list(dict.fromkeys(paths))
+    shown = paths[:10]
+    show = lambda p: op.relpath(p) + (op.sep if op.isdir(p) else '')
+    width = max(len(show(p)) for p in shown)
+    lines = []
+    for p in shown:
+        owner, group, _, mode = _owner_text(p)
+        lines.append(f"  {show(p).ljust(width)}  owner {owner}, group {group}, {mode}")
+    if len(paths) > len(shown):
+        lines.append(f"  ... ({len(paths)} in total)")
+    infos = [_owner_text(p) for p in paths]
+    owners = sorted({info[0] for info in infos})
+    foreign_group = any(info[2] not in my_groups for info in infos)
+    # the commands work on the pipeline's top folders (.snakemake, logs, results), which cover all
+    tops = []
+    for p in paths:
+        rel = op.relpath(p)
+        top = rel if rel.startswith('..') else rel.split(op.sep)[0]
+        if top not in tops:
+            tops.append(top)
+    names = ' '.join(tops)
+    advice = [f"{intro} you ({me}) cannot write in:", *lines]
+    if owners == [me]:
+        advice.append(f"They are yours, but not writable; fix it with: chmod -R u+w {names}")
+    else:
+        others = [o for o in owners if o != me]
+        advice.append(f"Ask {', '.join(others)} to make their files writable for a group you share, e.g.:")
+        for o in others:
+            advice.append(f"  find {names} -user {o} -exec chmod g+w {{}} +      (run by {o})")
+        if foreign_group:
+            advice.append(f"  find {names} -user <owner> -exec chgrp <a group you are both in> {{}} +"
+                          f"      (you are not in their group)")
+        advice.append("To prevent this, use configure(..., umask=0o002) in the Snakefile, and set the "
+                      "setgid bit on the pipeline's folders (chmod g+s) so that new files get their group.")
+    return '\n'.join(advice)
+
+
 def format_command(cmd):
     """A command as readable text: the program, then one argument per line, with an option and
     the one value that follows it on the same line. Arguments are quoted only where needed."""
@@ -201,6 +278,48 @@ def previous_run(log_file):
     return started, prefix, mapping
 
 
+class LoopOutput:
+    """An output with several files from one job, declared as e.g.
+    `tracts: JobLoop[Path] = Field('tract_{param}.tck')`, where `{param}` is a key within the job.
+    In run(), `output.tracts(param=2)` gives the full path of one file, and records it. A tool that
+    writes the files itself can get `output.tracts.prefix` or `output.tracts.pattern`; files that
+    run() does not record are then found after the job by their names.
+    """
+    def __init__(self, result, name, pattern, keys):
+        self._result = result
+        self._name = name
+        self._pattern = pattern  # relative to the result prefix, with only the keys left as {key}
+        self._keys = list(keys)
+        self._files = []         # recorded in run(): (keys, file name relative to the result prefix)
+
+    def __call__(self, **keys):
+        if set(keys) != set(self._keys):
+            raise TypeError(f"output '{self._name}' needs the key(s) {', '.join(self._keys)}, "
+                            f"got {', '.join(keys) or 'none'}")
+        keys = {k: str(keys[k]) for k in self._keys}
+        for k, v in keys.items():
+            if not v or '/' in v:
+                raise ValueError(f"output '{self._name}': key {k}={v!r} is not allowed (empty, or contains '/')")
+        name = self._pattern.format(**keys)
+        if (keys, name) not in self._files:
+            self._files.append((keys, name))
+        return Path(self._result._resolve_value(name))
+
+    @property
+    def prefix(self):
+        """The full path up to the first key, e.g. for a tool with an output prefix option."""
+        return self._result._resolve_value(self._pattern.split('{', 1)[0])
+
+    @property
+    def pattern(self):
+        """The full path with the keys as {key}."""
+        self.prefix  # creates the folder
+        return self._result._prefix + self._pattern
+
+    def __repr__(self):
+        return f'LoopOutput({self.pattern!r})'
+
+
 class JobResult():
     """The outputs of a job.
 
@@ -211,8 +330,9 @@ class JobResult():
     A rule that is connected to another rule without output name gets the other job's JobResult,
     with the same attribute access: `input.tracking.tracts`.
     """
-    def __init__(self, log_file, prefix=None, create=False, output_patterns=None):
+    def __init__(self, log_file, prefix=None, create=False, output_patterns=None, output_names=None):
         self._log_file = log_file
+        self._output_names = output_names  # the outputs a rule declares (OutputModel), if known
         self._create = create
         self._output_patterns = output_patterns or {}
         self._compiled_patterns = []
@@ -220,6 +340,7 @@ class JobResult():
         self._numbered_outputs = []
         self._errors = []
         self._warnings = []
+        self._loop_outputs = {}  # name -> LoopOutput, for outputs with several files (set by SnakeRule)
         
         if self._create:
             if prefix:
@@ -272,6 +393,8 @@ class JobResult():
             raise AttributeError(name)
 
         value = None
+        if name in self._loop_outputs:
+            return self._loop_outputs[name]
         if name in self._named_outputs:
             value = self._named_outputs[name]
         elif self._create:
@@ -281,10 +404,21 @@ class JobResult():
             elif (matched_value := self._match_pattern(name)) is not None:
                 value = matched_value
                 self._named_outputs[name] = value
+            elif self._output_names is not None:
+                # a typo should not quietly give None
+                if name in self._output_names:
+                    raise AttributeError(f"output '{name}' has no value yet; set it with output({name}=...)")
+                raise AttributeError(f"there is no output '{name}'; the outputs of this rule are: "
+                                     f"{', '.join(self._output_names) or 'none (no OutputModel)'}")
         else:
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
-        return self._resolve_value(value) if isinstance(value,str) else value
+        if not isinstance(value, str):
+            return value
+        path = self._resolve_value(value)
+        # inside run() a file output is a Path, as its annotation says; when read, it is validated
+        # against the receiving rule's InputModel
+        return Path(path) if self._create else path
 
 
     def _compile_patterns(self, patterns):
@@ -437,7 +571,7 @@ class JobMonitor():
     It can also be used without snakeplusplus rules, in a plain Snakemake rule, as
     `with JobMonitor(log[0], 'my job') as job: ...`.
     """
-    def __init__(self,log_file,job_name='Job',result_folder_or_prefix=None,output_patterns=None,shell_context=None,linemaps=None,params=None,stamp_file=None,tmpdir_autodelete=True,threads=1):
+    def __init__(self,log_file,job_name='Job',result_folder_or_prefix=None,output_patterns=None,output_names=None,shell_context=None,linemaps=None,params=None,stamp_file=None,tmpdir_autodelete=True,threads=1):
         if isinstance(log_file,str):
             self.log_file = log_file
         else:
@@ -458,7 +592,8 @@ class JobMonitor():
         else:
             prefix = op.join(result_folder_or_prefix,'')
             
-        self.result = JobResult(self.log_file,prefix=prefix,create=True,output_patterns=output_patterns)
+        self.result = JobResult(self.log_file,prefix=prefix,create=True,output_patterns=output_patterns,
+                                output_names=output_names)
         
         # allow JobMonitor to be run out-of-context
         self.started = datetime.now()
@@ -552,6 +687,13 @@ class JobMonitor():
                     message = str(exc_value)
                 else:
                     message = ''.join(traceback.format_exception_only(exc_type, exc_value)).rstrip()
+                if isinstance(exc_value, PermissionError) and exc_value.filename:
+                    try:
+                        blocked = blocked_paths(str(exc_value.filename))
+                        if blocked:
+                            message += '\n' + permission_advice(blocked, 'This job failed because')
+                    except Exception:
+                        pass  # the advice is a bonus; the error itself is reported anyway
                 err = message + '\n' + ''.join(where).rstrip()
             self.error(err)
             self.log(f'"{self.job_name}" failed after {format_elapsed(elapsed)} (h:mm:ss).')
@@ -735,6 +877,8 @@ class JobMonitor():
     def shell(self,script):
         """Run a shell script, e.g. a command with pipes or redirection, with its output in the log
         file. If the script exits with a nonzero code (that of its last command), the job fails.
+        The script is run as it is: braces are not filled in, so `awk '{print $1}'` works as in a
+        terminal; use an f-string to put in file names.
 
         Example:
             ```python
@@ -745,6 +889,9 @@ class JobMonitor():
         self.log(f'Running shell script:\n\n```\n{escape_fences(script.strip())}\n```\n')
         start = self._open_output_block()
         try:
-            sh(f'set +euo pipefail; exec >> {shlex.quote(self.running_log)} 2>&1; '+script,**self.shell_context)
+            # the script is used as it is (usually an f-string): braces are escaped, so that
+            # Snakemake's shell() does not fill them in a second time, e.g. in awk '{print $1}'
+            command = f'set +euo pipefail; exec >> {shlex.quote(self.running_log)} 2>&1; ' + script
+            sh(command.replace('{', '{{').replace('}', '}}'), **self.shell_context)
         finally:
             self._close_output_block(start)

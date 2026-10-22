@@ -20,7 +20,7 @@ stops the run: fix the cause, run again, and only what failed is redone.
   a `result_template` that says where each job writes; they can be reused, inherited and documented.
 - **Rules are connected explicitly** with `set_input(x=other.get_output('y'))` and
   `foreach(...)`; connection mistakes are caught before anything runs.
-- **One log file per job is the only thing Snakemake tracks.** Its extension shows the job's
+- **One log file per job tells what happened.** Snakemake's bookkeeping is derived from it. Its extension shows the job's
   state (`.queued`, `.running`, `.log`, `.error`, `.stale`), so the log folder is a live overview of the
   pipeline. Delete a log file to rerun that job.
 - **Errors never crash the run.** A failed job leaves an `.error` file; jobs that depend on it

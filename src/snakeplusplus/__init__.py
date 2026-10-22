@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from pydantic import BaseModel, Field, ConfigDict, TypeAdapter, Json
 from pydantic_core import PydanticUndefined
 
-from .jobmonitor import JobMonitor, JobResult, JobError, UpstreamFailedError, previous_run, format_upstream_failures, format_exception_remapped, replace_inner_extension, job_state_file, JOB_STATES, STAMP_DIR
+from .jobmonitor import JobMonitor, JobResult, LoopOutput, JobError, UpstreamFailedError, previous_run, format_upstream_failures, format_exception_remapped, replace_inner_extension, job_state_file, JOB_STATES, STAMP_DIR, blocked_paths, permission_advice
 
 import inspect
 import pathlib
@@ -28,7 +28,7 @@ __all__ = [
     # building blocks for rule classes
     'SnakeRule', 'SnakeCheckpoint', 'Fixed', 'Extensible', 'Field', 'Json', 'PathPrefix',
     # what SnakeRule.run() receives
-    'JobMonitor', 'JobResult', 'JobError',
+    'JobMonitor', 'JobResult', 'JobLoop', 'JobError',
     # Snakefile functions
     'configure', 'target', 'build',
 ]
@@ -38,7 +38,7 @@ _builder = None
 
 # Snakemake part of snakeplusplus, included by build(). (Snakefiles that include it themselves still work.)
 SNAKEFILE = op.join(op.dirname(op.abspath(__file__)), 'snakeplusplus.smk')
-_read_only = False  # set by snakeplusplus.doc: parse the Snakefile without touching any files
+_read_only = False  # set by snakeplusplus.diagram: parse the Snakefile without touching any files
 
 def _get_builder():
     if _builder is None:
@@ -76,23 +76,19 @@ def is_assignable(actual: type, expected: type) -> bool:
     return TypeHint(actual) <= TypeHint(expected)
 
 
-def _validate_keys(model, data):
-    required = {name for name, f in model.model_fields.items() if f.is_required()}
-    allowed = set(model.model_fields)
-
-    missing = required - data.keys()
-    extra_keys = data.keys() - allowed
-
-    extra_mode = model.model_config.get("extra", "ignore")
-
-    errors = []
-    if missing:
-        errors.append(f"missing={missing}")
-    if extra_keys and extra_mode == "forbid":
-        errors.append(f"extra={extra_keys}")
-
-    if errors:
-        raise ValueError("Model keys mismatch, "+' '.join(errors))
+def _validate_keys(model, data, owner='', what='keys'):
+    """Check that `data` has all required fields of `model`, and (for a Fixed model) no others."""
+    required = [name for name, f in model.model_fields.items() if f.is_required()]
+    missing = [k for k in required if k not in data]
+    extra = [k for k in data if k not in model.model_fields] if model.model_config.get("extra") == "forbid" else []
+    if missing or extra:
+        problems = []
+        if extra:
+            problems.append(f"unknown {what}: {', '.join(extra)}")
+        if missing:
+            problems.append(f"missing {what}: {', '.join(missing)}")
+        has = ', '.join(model.model_fields) or 'none'
+        raise ValueError(f"{owner}: {'; '.join(problems)}. The {what} are: {has}")
 
 
 def _validate_key(model, key, owner):
@@ -140,10 +136,11 @@ def _get_parser_types(parser: typing.Callable) -> tuple[type, type]:
     """
     target = parser.func if isinstance(parser, functools.partial) else parser
 
+    name = getattr(target, '__name__', repr(parser))
     params = [p for p in _positional_params(parser) if p.kind != p.VAR_POSITIONAL]
     if not params:
         raise ParserAnnotationError(
-            f"Parser {parser!r} must accept at least one positional argument"
+            f"Parser {name}() must accept at least one positional argument"
         )
 
     hints = typing.get_type_hints(target)
@@ -151,11 +148,11 @@ def _get_parser_types(parser: typing.Callable) -> tuple[type, type]:
     first_param = params[0]
     if first_param.name not in hints:
         raise ParserAnnotationError(
-            f"Parser {parser!r} must use type hints to enable code validation. Missing for input '{first_param.name}'."
+            f"Parser {name}() needs type hints, so that connections can be checked: add one for its argument '{first_param.name}'"
         )
     if "return" not in hints:
         raise ParserAnnotationError(
-            f"Parser {parser!r} must use type hints to enable code validation. Missing for returned variable."
+            f"Parser {name}() needs type hints, so that connections can be checked: add one for its return value"
         )
 
     return hints[first_param.name], hints["return"]
@@ -219,6 +216,37 @@ class PathPrefix(type(pathlib.Path())):
 def _prefix_matches(prefix):
     # a trailing separator would be removed by Path, so prefixes are handled as strings
     return sorted(glob.glob(glob.escape(prefix) + '*'))
+
+
+def _short_type_name(annotation):
+    """A type as written in code, without module names: JobLoop[Path | None] rather than
+    snakeplusplus.JobLoop[pathlib.Path | None]."""
+    if annotation is None:
+        return ''
+    name = getattr(annotation, '__name__', None)
+    if name and not getattr(annotation, '__args__', None):
+        return name
+    return re.sub(r"<class '([\w.]+)'>", r'\1', re.sub(r'\b(?:\w+\.)+(\w+)', r'\1', str(annotation)))
+
+
+def _loop_output_annotation(annotation):
+    """(JobLoop[...] annotation or None, optional) for an OutputModel field: an output with several
+    files from one job is annotated `JobLoop[Path]`, optionally `| None`."""
+    if typing.get_origin(annotation) is JobLoop:
+        return annotation, False
+    args = typing.get_args(annotation)
+    if type(None) in args:
+        loops = [a for a in args if typing.get_origin(a) is JobLoop]
+        if len(loops) == 1 and len(args) == 2:
+            return loops[0], True
+    return None, False
+
+
+def _loop_output_keys(rule_cls, field):
+    """The keys within a job of a loop output: the names in its file name pattern that are not
+    wildcards of the rule, e.g. ['param'] for 'tract_{param}.tck'."""
+    names = re.findall(r'\{(\w+)\}', field.default) if isinstance(field.default, str) else []
+    return [n for n in dict.fromkeys(names) if n not in rule_cls._wildcard_names()]
 
 
 def _is_prefix_annotation(annotation):
@@ -305,6 +333,20 @@ def _template_wildcards(template):
     """Names of the wildcards in a template, in order of appearance, without `{rule}`."""
     names = re.findall(r'\{(\w+)\}', template or '')
     return list(dict.fromkeys(n for n in names if n != 'rule'))
+
+
+def _check_model_names(cls):
+    """A nested class with a name close to InputModel, OutputModel or ParamModel is most likely a
+    typo, e.g. `outputModel`; it would be ignored, and the rule would silently have no outputs."""
+    import difflib
+    known = ['InputModel', 'OutputModel', 'ParamModel']
+    for name, value in cls.__dict__.items():
+        if isinstance(value, type) and name not in known:
+            close = difflib.get_close_matches(name, known, n=1, cutoff=0.75) or \
+                    [k for k in known if k.lower() == name.lower()]
+            if close:
+                raise TypeError(f"{cls.__name__}.{name}: did you mean {close[0]}? A class named {name} "
+                                f"is not used by snakeplusplus.")
 
 
 def _check_template(cls_name, attr, template):
@@ -421,7 +463,7 @@ def _dynamic(val, wildcards):
     `tck=lambda wildcards: tracking.get_output(f'DRT_{wildcards.hemi}')`."""
     if _is_input_function(val):
         val = val(wildcards)
-        if isinstance(val, (SnakeRule, JobLoop)):
+        if isinstance(val, (SnakeRule, LoopPromise)):
             val = val.get_output()
     return val
 
@@ -438,13 +480,13 @@ class _Wildcards(dict):
 def _promise_stamps(promise, wildcards):
     """The stamp file(s) Snakemake waits for, for an output promise of a rule or loop."""
     source = promise.rule_or_loop
-    if isinstance(source, JobLoop):
+    if isinstance(source, LoopPromise):
         return source._input_stamps(wildcards)
     return source._stamp_path(source._own_wildcards(wildcards))
 
 
 def _is_input_function(val):
-    return callable(val) and not isinstance(val, (SnakeRule, JobLoop, OutputPromise, type))
+    return callable(val) and not isinstance(val, (SnakeRule, LoopPromise, OutputPromise, type))
 
 
 class SnakeRule:
@@ -533,6 +575,7 @@ class SnakeRule:
                             f"    threads_budget = {cls.__dict__['threads']!r}")
         _threads_for(cls.threads_budget, 8, cls.__name__)  # checks the expression
         _check_template(cls.__name__, 'result_template', cls.result_template)
+        _check_model_names(cls)
         if cls.log_template is not None:
             _check_template(cls.__name__, 'log_template', cls.log_template)
             if set(_template_wildcards(cls.log_template)) != set(_template_wildcards(cls.result_template)):
@@ -547,6 +590,12 @@ class SnakeRule:
                                 f"from Fixed or Extensible")
             attrs = {k: v for k, v in vars(model).items() if k not in ('__dict__', '__weakref__')}
             setattr(cls, name, type(name, (Fixed,), attrs))
+        for key, field in cls.OutputModel.model_fields.items():
+            if _loop_output_annotation(field.annotation)[0] is not None:
+                if not isinstance(field.default, str) or not _loop_output_keys(cls, field):
+                    raise TypeError(f"{cls.__name__}.OutputModel.{key}: an output with several files needs a "
+                                    f"file name pattern with at least one key that is not a wildcard of the "
+                                    f"rule, e.g. Field('{key}_{{param}}.tck')")
 
 
     @classmethod
@@ -615,7 +664,7 @@ class SnakeRule:
             fit = FitTensor().set_input(dwi=denoise.get_output('denoised'))
             ```
         """
-        _validate_keys(self.InputModel,inputs)
+        _validate_keys(self.InputModel, inputs, f'{type(self).__name__}.set_input()', 'inputs')
 
         # type-check the inputs in sofar possible at build time
         model_fields = self.InputModel.model_fields
@@ -626,11 +675,16 @@ class SnakeRule:
             expected_type = field.annotation
             value = inputs[key]
 
-            if isinstance(value, (SnakeRule, JobLoop)):
+            if isinstance(value, (SnakeRule, LoopPromise)):
                 value = value.get_output()
                 inputs[key] = value
 
             if isinstance(value, OutputPromise):
+                value = value._for_receiver(self._wildcard_names())
+                inputs[key] = value
+                if value.condition:
+                    self._check_condition(key, value.condition, expected_type)
+                self._check_wildcards_provided(key, value)
                 unknown = value.key_wildcards - set(self._wildcard_names())
                 if unknown:
                     raise TypeError(f"{type(self).__name__}.{key}: get_output({value.key!r}) uses "
@@ -638,10 +692,10 @@ class SnakeRule:
                                     f"wildcard of {type(self).__name__}")
                 actual_type = value.annotation # validates rule.get_output() and foreach().get_output()
                 if not is_assignable(actual_type, expected_type):
+                    source = type(value._rule()).__name__ + ('.foreach(...)' if isinstance(value.rule_or_loop, LoopPromise) and not value.rule_or_loop.scalar else '')
                     raise TypeError(
-                        f"Type mismatch: {type(value.rule_or_loop).__name__}.{value.key} "
-                        f"produces {actual_type!r}, but {type(self).__name__}.{key} "
-                        f"expects {expected_type!r}"
+                        f"Type mismatch: {source}.{value.key} produces {_short_type_name(actual_type)}, "
+                        f"but {type(self).__name__}.{key} expects {_short_type_name(expected_type)}"
                     )
             elif _is_input_function(value):
                 # input function, its result is only known at run time
@@ -652,11 +706,71 @@ class SnakeRule:
 
         # promises that are not covered by model_fields (Extensible InputModel)
         for key, value in inputs.items():
-            if isinstance(value, (SnakeRule, JobLoop)):
+            if isinstance(value, (SnakeRule, LoopPromise)):
                 inputs[key] = value.get_output()
 
         self.inputs = inputs
         return self
+
+
+    def _check_condition(self, key, condition, expected_type):
+        """A connection made with when(): its parameters must be parameters of this rule, with
+        valid values, and the input must admit None, which it gets when the condition fails."""
+        from pydantic import ValidationError
+        cls = type(self).__name__
+        fields = self.ParamModel.model_fields
+        unknown = [p for p in condition if p not in fields]
+        if unknown:
+            raise TypeError(f"{cls}.{key}: when({', '.join(unknown)}=...) is not a parameter of {cls}; "
+                            f"its parameters are: {', '.join(fields) or 'none'}")
+        for name, value in condition.items():
+            try:
+                TypeAdapter(fields[name].annotation).validate_python(value)
+            except ValidationError as e:
+                raise TypeError(f"{cls}.{key}: when({name}={value!r}) is not a valid value for "
+                                f"parameter {name!r}: {e.errors()[0]['msg']}") from None
+        if not is_assignable(type(None), expected_type):
+            raise TypeError(f"{cls}.{key} is connected with when(), so it is None when the condition "
+                            f"does not hold; annotate it as optional, e.g. "
+                            f"`{key}: {_short_type_name(expected_type)} | None = None`")
+
+
+    def _condition_holds(self, promise, wildcards, params=None):
+        """Whether a connection made with when() applies to a job: `params` are the job's resolved
+        parameters (in the job itself), or else the rule's, where a function is called with the
+        wildcards."""
+        if not promise.condition:
+            return True
+        fields = self.ParamModel.model_fields
+        for name, wanted in promise.condition.items():
+            if params is not None:
+                value = params.get(name)
+            else:
+                value = self._snake_params.get(name)
+                if callable(value):
+                    value = value(wildcards)
+            adapter = TypeAdapter(fields[name].annotation)
+            try:
+                if adapter.validate_python(value) != adapter.validate_python(wanted):
+                    return False
+            except Exception:
+                return False
+        return True
+
+
+    def _check_wildcards_provided(self, key, promise):
+        """Every wildcard of the source rule must come from the loop or from this rule."""
+        source = promise.rule_or_loop
+        rule = source.rule if isinstance(source, LoopPromise) else source
+        given = source._known_wildcards() if isinstance(source, LoopPromise) else set()
+        if given is None:
+            return  # set by a function, only known when it runs
+        missing = set(rule._wildcard_names()) - given - set(self._wildcard_names())
+        if missing:
+            names = ', '.join('{' + w + '}' for w in sorted(missing))
+            raise TypeError(f"{type(self).__name__}.{key}: {type(rule).__name__} has wildcard(s) {names}, "
+                            f"which neither the connection nor {type(self).__name__} provides; use "
+                            f".foreach(...) or .where(...) on {type(rule).__name__}")
 
 
     def get_output(self, key=None, parser=None):
@@ -665,7 +779,9 @@ class SnakeRule:
         Args:
             key: Name of a field of `OutputModel`. It can also be a pattern like `'DRT_{hemi}'`,
                 which picks the output per job, using the wildcards of the receiving rule. Without
-                key, the receiving rule gets the whole `JobResult`.
+                key, the receiving rule gets the whole `JobResult`. For an output with several
+                files (`JobLoop[Path]`), its keys are filled in by the wildcards of the receiving
+                rule that have their names, like wildcards: with all keys, it gets a single file.
             parser: Function that converts the output before it is passed on, e.g. reads a
                 number from the file. Its type hints are used for type checking. If it has a
                 second argument, it gets the wildcards.
@@ -677,20 +793,41 @@ class SnakeRule:
         return OutputPromise(self, key, parser)
 
 
-    def foreach(self, *wildcard_list_of_dicts, **wildcard_dict_of_lists):
-        """A loop over jobs of this rule, to connect all their outputs at once.
+    def foreach(self, *args, **kwargs):
+        """A loop over jobs of this rule, to connect all their outputs at once. Each call adds one
+        loop level, in one of these forms:
 
-        Give the wildcard values as lists, `rule.foreach(subject=['01', '02'])`, or as a function
-        that yields one dict per job, `rule.foreach(all_subjects)`; such a function gets the
-        wildcards of the receiving job, and may read the result of a checkpoint. Wildcards of the
-        receiving job that the loop does not set are passed on. Use `.get_output()` on the loop.
+        - `rule.foreach(subject=['01', '02'])`: one wildcard, a list of values;
+        - `rule.foreach(subject=function)`: `function(wildcards)` returns that list;
+        - `rule.foreach([dict(subject='01', session='a'), ...])`: explicit combinations;
+        - `rule.foreach(function)`: `function(wildcards)` returns such a list of dicts, e.g. read
+          from a file, or from the result of a checkpoint.
+
+        Chained calls are nested loops, outer first: `rule.foreach(subject=[...]).foreach(session=[...])`
+        gives all combinations. A function gets the wildcards of the receiving job and of the outer
+        levels, so that each subject can have its own sessions. Wildcards of the receiving job that
+        the loop does not set are passed on. Use `.get_output()` on the loop; the receiving rule gets
+        a `JobLoop`, a list that knows the wildcards of each item.
 
         Example:
             ```python
-            group = GroupStats().set_input(fa=fit.foreach(all_subjects).get_output('fa'))
+            group = GroupStats().set_input(fa=fit.foreach(subject=subjects).get_output('fa'))
             ```
         """
-        return JobLoop(self, *wildcard_list_of_dicts, **wildcard_dict_of_lists)
+        return LoopPromise(self).foreach(*args, **kwargs)
+
+
+    def where(self, **wildcards):
+        """Fix wildcards of this rule to single values, e.g. `rule.where(subject='template')`: the
+        connection is to that one job (or, followed by `foreach`, to a loop within it).
+
+        Example:
+            ```python
+            register = Register().set_input(atlas=atlas.where(subject='template').get_output('image'))
+            test_run = target(tckgen.where(subject='01').foreach(hemi=['L', 'R']))
+            ```
+        """
+        return LoopPromise(self).where(**wildcards)
 
 
     def run(self, job, input, output, params, wildcards):
@@ -750,7 +887,7 @@ class SnakeRule:
 
         # merge parameters (constructor params have priority over config params)
         params = {**config_params, **self.params}
-        _validate_keys(self.ParamModel,params)
+        _validate_keys(self.ParamModel, params, f'Rule {name} ({type(self).__name__})', 'parameters')
         self.params = params
         self._validate_param_values()
 
@@ -815,12 +952,23 @@ class SnakeRule:
         previous = previous_run(log_path)  # read before JobMonitor replaces the job's file
 
         with JobMonitor(log_path, descr, result_path, output_patterns=output_patterns,
+                        # an Extensible OutputModel allows undeclared outputs; otherwise a typo is an error
+                        output_names=(None if self.OutputModel.model_config.get('extra') == 'allow'
+                                      else list(self.OutputModel.model_fields)),
                         shell_context=rule_context, linemaps=_get_builder().linemaps,
                         params=params_dict, stamp_file=stamp, tmpdir_autodelete=self.tmpdir_autodelete,
                         threads=rule_context.get('threads', 1)) as job:
             if setup_error:
                 raise setup_error
+            for key, field in self.OutputModel.model_fields.items():
+                if _loop_output_annotation(field.annotation)[0] is not None:
+                    keys = _loop_output_keys(type(self), field)
+                    pattern = partial_formatter.format(field.default, params=raw_params, **_as_dict(wildcards))
+                    job.result._loop_outputs[key] = LoopOutput(job.result, key, pattern, keys)
             job_inputs = {key: _dynamic(val, wildcards) for key, val in self.inputs.items()}
+            for key, val in job_inputs.items():
+                if isinstance(val, OutputPromise) and not self._condition_holds(val, wildcards, dict(raw_params.items())):
+                    job_inputs[key] = None  # connected with when(), and its condition does not hold
             if previous:
                 self._remove_previous_outputs(job, previous, wildcards, job_inputs)
             failed = self._check_failed_inputs(job, wildcards, job_inputs)
@@ -842,6 +990,10 @@ class SnakeRule:
         result = job.result
         missing, invalid = [], []
         for key, field in self.OutputModel.model_fields.items():
+            loop_annotation, loop_optional = _loop_output_annotation(field.annotation)
+            if loop_annotation is not None:
+                self._check_loop_output(job, key, loop_optional, missing)
+                continue
             is_path, optional = _path_annotation(field.annotation)
             if not is_path:
                 # other outputs are declared with output(name=value), unless they have a default
@@ -892,6 +1044,33 @@ class SnakeRule:
             raise JobError('\n'.join(problems))
 
 
+    def _check_loop_output(self, job, key, optional, missing):
+        """An output with several files: the files recorded in run() must exist; if run() recorded
+        none, the files that match the pattern and were made by this run are taken. They are listed,
+        with their keys, in the log."""
+        result = job.result
+        loop_output = result._loop_outputs[key]
+        if loop_output._files:
+            files = loop_output._files
+            absent = [name for _, name in files if not op.exists(result._resolve_value(name))]
+            if absent:
+                missing.append(f"  {key}: {', '.join(absent)} (recorded in run(), but not created)")
+                return
+        else:
+            found = JobLoop.from_pattern(loop_output.pattern)
+            files = []
+            for wc, path in found.items():
+                if _created_since(str(path), job.started):
+                    keys = {k: str(wc[k]) for k in loop_output._keys}
+                    files.append((keys, loop_output._pattern.format(**keys)))
+        if files:
+            result._named_outputs[key] = {'files': [{'keys': keys, 'file': name} for keys, name in files]}
+            shown = ', '.join(name for _, name in files[:10]) + (f', ... ({len(files)} in total)' if len(files) > 10 else '')
+            job.log(f"Output '{key}': {shown}")
+        elif not optional:
+            missing.append(f"  {key}: {loop_output.pattern} (no files with this pattern were created)")
+
+
     def _remove_previous_outputs(self, job, previous, wildcards, job_inputs):
         """Remove the outputs of the previous run of this job, as listed in its log, so that the
         new run starts clean. To protect files that this job did not make, a path is removed only if
@@ -912,7 +1091,9 @@ class SnakeRule:
         paths = [full(v) for v in mapping.get('by_number', [])]
         for key, value in mapping.get('by_name', {}).items():
             field = self.OutputModel.model_fields.get(key)
-            if field is not None and _is_prefix_annotation(field.annotation):
+            if field is not None and isinstance(value, dict) and _loop_output_annotation(field.annotation)[0] is not None:
+                paths += [full(f.get('file')) for f in value.get('files', [])]
+            elif field is not None and _is_prefix_annotation(field.annotation):
                 # an empty prefix name stands for all files of the job
                 paths += _prefix_matches(full(value, empty_ok=True)) if full(value, empty_ok=True) else []
             elif field is None or _path_annotation(field.annotation)[0]:
@@ -968,7 +1149,7 @@ class SnakeRule:
                 if isinstance(val, str):
                     add(partial_formatter.format(val, **wildcards))
                 elif isinstance(val, (list, tuple)):
-                    add([partial_formatter.format(v, **wildcards) for v in val])
+                    add([partial_formatter.format(v, **wildcards) if isinstance(v, str) else v for v in val])
                 elif isinstance(val, OutputPromise):
                     logs = val.rule_or_loop.log_path(wildcards)
                     for log in (logs if isinstance(logs, list) else [logs]):
@@ -976,6 +1157,8 @@ class SnakeRule:
                         for v in list(result._named_outputs.values()) + result._numbered_outputs:
                             if isinstance(v, (str, list, tuple)):
                                 add(result._resolve_value(v))
+                            elif isinstance(v, dict):  # an output with several files
+                                add([result._resolve_value(f['file']) for f in v.get('files', [])])
                 else:
                     add(val)
             except Exception as e:
@@ -1008,26 +1191,57 @@ class SnakeRule:
         return failed
 
 
-    def _resolve(self, wildcards, key, parser, failed={}):
+    def _resolve(self, wildcards, key, parser, failed={}, select=()):
         log = self.log_path(wildcards)
         if log in failed:
             return failed[log]  # parsers are not applied to a failed job's output
-        val = self._read_output(JobResult(log), key, wildcards)
+        val = self._read_output(JobResult(log), key, wildcards, select)
         return _apply_parser(parser, val, wildcards)
 
 
-    def _read_output(self, result, key, wildcards):
+    def _read_output(self, result, key, wildcards, select=()):
         """Output `key` of a finished job: a full path for path-typed fields, the plain value for
         other fields (or the OutputModel default if the job did not declare it).
 
         A required file output that is not listed in the job's log (e.g. a log written by an older
         version of snakeplusplus) is found by its default file name; if that does not exist either,
-        the job that wants it fails with a clear message. An optional one resolves to None."""
+        the job that wants it fails with a clear message. An optional one resolves to None.
+
+        For an output with several files, `select` are the keys whose values come from `wildcards`
+        (the receiving job's): the files with those values, or the one file if all keys are given."""
         if key is None:
             return result
         field = self.OutputModel.model_fields.get(key)
         if field is None:
             return _output_value(result, key)
+        loop_annotation, loop_optional = _loop_output_annotation(field.annotation)
+        if loop_annotation is not None:
+            # an output with several files: a JobLoop with the wildcards of the job and the keys
+            value = result._named_outputs.get(key)
+            if not isinstance(value, dict):
+                if loop_optional:
+                    return None
+                raise JobError(f"{type(self).__name__} did not produce its output {key!r} "
+                               f"(log-file: {result._log_file})")
+            own = self._own_wildcards(wildcards)
+            keys = _loop_output_keys(type(self), field)
+            files = value.get('files', [])
+            loop = JobLoop([result._resolve_value(f['file']) for f in files],
+                           [{**own, **f['keys']} for f in files], self._wildcard_names() + keys)
+            if not select:
+                return loop
+            chosen = {k: wildcards[k] for k in select}
+            loop = loop.where(**chosen)
+            if set(select) != set(keys):
+                return loop
+            if len(loop) == 1:
+                return loop[0]
+            if loop_optional:
+                return None
+            made = ', '.join(sorted({str(f['keys'][k]) for f in files for k in select})) or 'none'
+            raise JobError(f"{type(self).__name__} did not produce {key!r} for "
+                           f"{', '.join(f'{k}={v}' for k, v in chosen.items())} (it made: {made}; "
+                           f"log-file: {result._log_file})")
         is_path, optional = _path_annotation(field.annotation)
         if is_path:
             value = _output_value(result, key)
@@ -1059,9 +1273,11 @@ class SnakeRule:
                 # simple filename input
                 inp[key] = partial_formatter.format(val, **wildcards)
             elif isinstance(val, (list, tuple)):
-                inp[key] = [partial_formatter.format(v, **wildcards) for v in val]
+                items = [partial_formatter.format(v, **wildcards) if isinstance(v, str) else v for v in val]
+                inp[key] = JobLoop(items, val._wildcards, val._names) if isinstance(val, JobLoop) else items
             elif isinstance(val, OutputPromise):
-                inp[key] = val.rule_or_loop._resolve(wildcards, val._key_for(wildcards), val.parser, failed)
+                inp[key] = val.rule_or_loop._resolve(wildcards, val._key_for(wildcards), val.parser, failed,
+                                                     val.select)
             else:
                 inp[key] = val
         return inp
@@ -1100,10 +1316,13 @@ class SnakeRule:
                 paths.append(val)
             elif isinstance(val, (list, tuple)):
                 # multiple filename input
-                paths.append(val)
+                paths.append([str(v) for v in val])
             elif isinstance(val, OutputPromise):
-                # input via a SnakeRule or a loop over a SnakeRule; account for checkpoints here
-                paths.append(snake_checkpoint_magic(lambda wildcards, p=val: _promise_stamps(p, wildcards)))
+                # input via a SnakeRule or a loop over a SnakeRule; account for checkpoints here.
+                # A connection made with when() is left out for jobs whose parameters do not match.
+                paths.append(snake_checkpoint_magic(
+                    lambda wildcards, p=val: _promise_stamps(p, wildcards)
+                    if self._condition_holds(p, wildcards) else []))
             elif _is_input_function(val):
                 # input function that returns paths, or a connection to another rule
                 def paths_of(wildcards, fn=val):
@@ -1179,16 +1398,23 @@ class SnakeRule:
 
 
 class OutputPromise:
-    def __init__(self, rule_or_loop, key=None, parser=None):
+    """A connection to an output of a rule or loop, as `get_output()` returns it, to pass to
+    `set_input()` of another rule. It only describes the connection; the value is read per job."""
+    def __init__(self, rule_or_loop, key=None, parser=None, select=(), condition=None):
         self.rule_or_loop = rule_or_loop
         self.key = key
         self.parser = parser
+        # parameter values of the receiving rule for which this connection is made, see when()
+        self.condition = dict(condition or {})
+        # keys of an output with several files that the receiving job's wildcards fill in, e.g.
+        # ('hemi',) for 'tract_{hemi}.tck' connected to a rule with wildcard {hemi}
+        self.select = tuple(select)
         # a key pattern like 'DRT_{hemi}' picks the output per job, from the wildcards of the receiving job
         self.key_wildcards = set(re.findall(r'\{(\w+)\}', key)) if key else set()
         self._annotation = self._compute_annotation()  # computes the expected output type of this promise
 
     def _compute_annotation(self):
-        is_loop = isinstance(self.rule_or_loop, JobLoop)
+        is_loop = isinstance(self.rule_or_loop, LoopPromise)
 
         if self.key is None:
             # No specific field: the promise resolves to the whole JobResult,
@@ -1202,9 +1428,17 @@ class OutputPromise:
                 base = types[0] if len(types) == 1 else typing.Union[tuple(types)]
             else:
                 base = fields[self.key].annotation
+                if self.select:
+                    loop_annotation, optional = _loop_output_annotation(base)
+                    if set(self.select) == set(_loop_output_keys(type(self._rule()), fields[self.key])):
+                        # all keys filled in: a single file
+                        item, = typing.get_args(loop_annotation)
+                        base = typing.Optional[item] if optional else item
 
         if is_loop and not self.rule_or_loop.scalar:
-            base = typing.List[base]
+            loop_annotation = _loop_output_annotation(base)[0]
+            # an output with several files is flattened over the loop: still JobLoop[...]
+            base = loop_annotation if loop_annotation is not None else JobLoop[base]
 
         if self.parser is None:
             return base
@@ -1223,7 +1457,27 @@ class OutputPromise:
         return self._annotation
 
     def _rule(self):
-        return self.rule_or_loop.rule if isinstance(self.rule_or_loop, JobLoop) else self.rule_or_loop
+        return self.rule_or_loop.rule if isinstance(self.rule_or_loop, LoopPromise) else self.rule_or_loop
+
+    def _for_receiver(self, wildcard_names):
+        """This connection as seen by a rule with these wildcards: the keys of an output with several
+        files that have the name of one of its wildcards are filled in from it, like wildcards."""
+        if self.key is None or self.key_wildcards or self.select:
+            return self
+        field = self._rule().OutputModel.model_fields[self.key]
+        if _loop_output_annotation(field.annotation)[0] is None:
+            return self
+        select = [k for k in _loop_output_keys(type(self._rule()), field) if k in wildcard_names]
+        return OutputPromise(self.rule_or_loop, self.key, self.parser, select, self.condition) if select else self
+
+    def when(self, **params):
+        """Make this connection only for jobs whose parameters have these values, e.g.
+        `expensive.get_output('x').when(use_alt=True)`. Otherwise the upstream job is not run and the
+        input is None, so it must be annotated as optional, e.g. `Path | None`. The parameters are
+        those of the receiving rule; this is checked in its set_input()."""
+        if not params:
+            raise TypeError("when() needs at least one parameter, e.g. when(use_alt=True)")
+        return OutputPromise(self.rule_or_loop, self.key, self.parser, self.select, {**self.condition, **params})
 
     def _key_for(self, wildcards):
         """The output name for one job: a key pattern filled in with the wildcards of that job."""
@@ -1236,35 +1490,209 @@ class OutputPromise:
         return key
 
 
-class JobLoop:
-    def __init__(self,rule,*wildcard_list_of_dicts,**wildcard_dict_of_lists):
-        """
-        Use wildcard_list_of_dicts to define a group of wildcards.
-        - Each element is a list of dicts, or a function(parent_wildcards) that yields dicts,
-          containing wildcard name/value pairs.
+def _loop_level(rule, args, kwargs):
+    """One loop level from the arguments of foreach(): checked here, so that mistakes are reported
+    at the line of the Snakefile."""
+    cls = type(rule).__name__
+    names = rule._wildcard_names()
+    if len(args) + len(kwargs) != 1:
+        if len(kwargs) > 1 and not args:
+            keys = list(kwargs)
+            raise TypeError(
+                f"{cls}.foreach() takes one wildcard at a time, got {', '.join(keys)}. For all combinations, "
+                f"chain the loops: .foreach({keys[0]}=[...]).foreach({keys[1]}=[...]); for specific "
+                f"combinations, give a list of dicts: .foreach([dict({keys[0]}=..., {keys[1]}=...), ...])")
+        raise TypeError(f"{cls}.foreach() takes either one wildcard (foreach(subject=[...])) or one list "
+                        f"of dicts or function (foreach([dict(...), ...]))")
+    if kwargs:
+        (name, values), = kwargs.items()
+        if name not in names:
+            raise TypeError(f"{cls} has no wildcard '{name}'; it has: {', '.join(names) or 'none'}")
+        if callable(values):
+            return ('values', name, values)
+        if isinstance(values, (str, bytes, int, float)):
+            raise TypeError(f"{cls}.foreach({name}={values!r}) is a single value; use "
+                            f".where({name}={values!r}) for that, or a list for a loop")
+        values = list(values)
+        _check_values(cls, name, values)
+        return ('values', name, values)
+    arg, = args
+    if callable(arg):
+        return ('dicts', arg)
+    if isinstance(arg, dict):
+        raise TypeError(f"{cls}.foreach() got a single dict; use .where(**...) for a single job, or a list of dicts")
+    dicts = list(arg)
+    for d in dicts:
+        if not isinstance(d, dict):
+            raise TypeError(f"{cls}.foreach() takes a list of dicts, but got an item {d!r}")
+        unknown = set(d) - set(names)
+        if unknown:
+            raise TypeError(f"{cls} has no wildcard(s) {', '.join(sorted(unknown))}; it has: {', '.join(names) or 'none'}")
+        for k, v in d.items():
+            _check_values(cls, k, [v])
+    return ('dicts', dicts)
 
-        Use wildcard_dict_of_lists as an alternative or supplemental method.
-        - Each item contains value(s) for a single wildcard name.
-        - The value can be a single string or array of strings; all arrays must have the same length.
 
-        The loop is 'scalar' (resolves to a single value instead of a list) if it only
-        uses wildcard_dict_of_lists with single values.
-        """
+def _fixed_wildcards(rule, wildcards):
+    cls = type(rule).__name__
+    names = rule._wildcard_names()
+    for name, value in wildcards.items():
+        if name not in names:
+            raise TypeError(f"{cls} has no wildcard '{name}'; it has: {', '.join(names) or 'none'}")
+        if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            raise TypeError(f"{cls}.where({name}={value!r}) needs a single value; use .foreach({name}=[...]) "
+                            f"for a loop")
+        _check_values(cls, name, [value])
+    return {k: str(v) for k, v in wildcards.items()}
+
+
+def _check_values(cls, name, values):
+    for v in values:
+        if isinstance(v, (list, tuple, dict, set)) or not str(v) or '/' in str(v):
+            raise ValueError(f"{cls}: wildcard {name}={v!r} is not allowed: a wildcard value is a single, "
+                             f"non-empty value without '/'")
+
+
+T = typing.TypeVar('T')
+
+
+class JobLoop(typing.List[T]):
+    """The outputs of a loop over jobs (`rule.foreach(...)`), as the receiving rule gets them when
+    its input is annotated `JobLoop[...]`, e.g. `fa: JobLoop[Path]` or `JobLoop[Path | JobError]`.
+
+    It is a list, in loop order (nested loops: outer first), that also knows the wildcards of each
+    item:
+
+    - `items()`: pairs of (wildcards, value), e.g. `wc.subject`;
+    - `where(subject='01')`: the items with these wildcard values, again a JobLoop;
+    - `get(subject='01', session='a')`: the one value with these wildcard values;
+    - `groupby('subject')`: a dict from each subject to a JobLoop of its items;
+    - `to_pandas()`: a table with a column per wildcard and a column `value` (needs pandas).
+
+    With an input annotated `list[...]`, the receiving rule gets a plain list instead.
+
+    `JobLoop[Path]` is also the type of an output with several files from one job, e.g.
+    `tracts: JobLoop[Path] = Field('tract_{param}.tck')`, where `{param}` is a key within the job;
+    in `run()`, `output.tracts(param=p)` gives the path of one file.
+    """
+    def __init__(self, values=(), wildcards=None, names=None):
+        """A JobLoop from values and, optionally, the wildcards of each value (a list of dicts in
+        the same order). Usually it comes from a loop, or from `JobLoop.from_pattern()`."""
+        super().__init__(values)
+        if wildcards is not None:
+            wildcards = [w if isinstance(w, _Wildcards) else _Wildcards(w) for w in wildcards]
+            if len(wildcards) != len(self):
+                raise ValueError(f"JobLoop: {len(self)} values but {len(wildcards)} sets of wildcards")
+            if names is None:
+                names = list(dict.fromkeys(k for w in wildcards for k in w))
+        self._wildcards = wildcards  # one dict per item, in the same order; None if not known
+        self._names = list(names) if names is not None else None
+
+    @classmethod
+    def from_pattern(cls, pattern):
+        """The existing files that match a file name pattern, with the wildcards read from their
+        names, like Snakemake's `glob_wildcards`; e.g. results of another pipeline:
+        `JobLoop.from_pattern('/data/sub-{subject}/ses-{session}/fa.nii.gz')`. A wildcard matches
+        one part of the path (no '/'); the items are sorted by file name."""
+        names = re.findall(r'\{(\w+)\}', pattern)
+        regex, pos, seen = '', 0, set()
+        for m in re.finditer(r'\{(\w+)\}', pattern):
+            name = m.group(1)
+            regex += re.escape(pattern[pos:m.start()]) + (f'(?P={name})' if name in seen else f'(?P<{name}>[^/]+)')
+            seen.add(name)
+            pos = m.end()
+        regex = re.compile(regex + re.escape(pattern[pos:]) + '$')
+        found = []
+        for path in sorted(glob.glob(re.sub(r'\{\w+\}', '*', glob.escape(pattern).replace('[{]', '{').replace('[}]', '}')))):
+            match = regex.match(path)
+            if match:
+                found.append((pathlib.Path(path), match.groupdict()))
+        return cls([p for p, _ in found], [w for _, w in found], list(dict.fromkeys(names)))
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type, handler):
+        # checks every item against the item type, and keeps the wildcards
+        from pydantic_core import core_schema
+        args = typing.get_args(source_type)
+        items = core_schema.list_schema(handler.generate_schema(args[0]) if args else core_schema.any_schema())
+        def validate(value, check_items):
+            checked = check_items(list(value))
+            return cls(checked, getattr(value, '_wildcards', None), getattr(value, '_names', None))
+        return core_schema.no_info_wrap_validator_function(validate, items)
+
+    def _check_names(self, names):
+        if self._wildcards is None:
+            raise ValueError("these values have no wildcards (they did not come from a loop)")
+        unknown = [n for n in names if n not in self._names]
+        if unknown:
+            raise KeyError(f"no wildcard(s) {', '.join(unknown)}; the wildcards are: {', '.join(self._names)}")
+
+    def items(self):
+        """Pairs of (wildcards, value), in loop order."""
+        self._check_names([])
+        return list(zip(self._wildcards, self))
+
+    def where(self, **wildcards):
+        """The items whose wildcards have these values, as a JobLoop."""
+        self._check_names(wildcards)
+        keep = [i for i, wc in enumerate(self._wildcards)
+                if all(str(wc.get(k)) == str(v) for k, v in wildcards.items())]
+        return JobLoop([self[i] for i in keep], [self._wildcards[i] for i in keep], self._names)
+
+    def get(self, **wildcards):
+        """The one value whose wildcards have these values; an error if there is none, or more than one."""
+        found = self.where(**wildcards)
+        if len(found) != 1:
+            raise KeyError(f"{len(found)} items with {wildcards}, expected exactly one")
+        return found[0]
+
+    def groupby(self, name):
+        """A dict from each value of wildcard `name` to a JobLoop of its items, in loop order."""
+        self._check_names([name])
+        groups = {}
+        for wc in self._wildcards:
+            groups.setdefault(wc[name], None)
+        return {value: self.where(**{name: value}) for value in groups}
+
+    def to_pandas(self):
+        """A pandas DataFrame with a column per wildcard and a column `value`."""
+        import pandas
+        self._check_names([])
+        return pandas.DataFrame([{**{n: wc.get(n) for n in self._names}, 'value': v}
+                                 for wc, v in zip(self._wildcards, self)])
+
+    def __repr__(self):
+        return f'JobLoop({list.__repr__(self)})'
+
+
+class LoopPromise:
+    """A loop over jobs of a rule, as written in the Snakefile: `rule.foreach(...)` and `rule.where(...)`,
+    possibly chained. Like OutputPromise, it describes what to connect; the jobs it covers are only
+    worked out per receiving job (see members()).
+
+    `levels` are the nested loop levels, outer first; each is ('values', name, list or function) or
+    ('dicts', list of dicts or function). `fixed` are the wildcards set with where(). Without
+    levels, the loop is 'scalar': it stands for a single job, and resolves to a single value.
+    """
+    def __init__(self, rule, levels=(), fixed=None):
         self.rule = rule
-        self.wildcard_iterables = list(wildcard_list_of_dicts)
+        self.levels = list(levels)
+        self.fixed = dict(fixed or {})
 
-        lengths = {len(v) for v in wildcard_dict_of_lists.values() if isinstance(v, (list, tuple))}
-        if len(lengths) > 1:
-            raise ValueError(f"foreach: all lists must have the same length, got lengths {sorted(lengths)}")
-        self.scalar = not wildcard_list_of_dicts and not lengths
 
-        if wildcard_dict_of_lists:
-            count = lengths.pop() if lengths else 1
-            def dict_of_lists_iterator(parent_wildcards):
-                for i in range(count):
-                    yield {k: (v[i] if isinstance(v, (list, tuple)) else v)
-                           for k, v in wildcard_dict_of_lists.items()}
-            self.wildcard_iterables.append(dict_of_lists_iterator)
+    @property
+    def scalar(self):
+        return not self.levels
+
+
+    def foreach(self, *args, **kwargs):
+        """Add a nested loop level; see SnakeRule.foreach()."""
+        return LoopPromise(self.rule, self.levels + [_loop_level(self.rule, args, kwargs)], self.fixed)
+
+
+    def where(self, **wildcards):
+        """Fix wildcards to single values; see SnakeRule.where()."""
+        return LoopPromise(self.rule, self.levels, {**self.fixed, **_fixed_wildcards(self.rule, wildcards)})
 
 
     def get_output(self, key=None, parser=None):
@@ -1274,34 +1702,45 @@ class JobLoop:
 
 
     def _known_wildcards(self):
-        """Names of the wildcards this loop sets, or None if not known before running (an iterator function)."""
-        names = set()
-        for it in self.wildcard_iterables:
-            if callable(it) and getattr(it, '__name__', '') != 'dict_of_lists_iterator':
+        """Names of the wildcards this loop sets, or None if that is only known when it runs
+        (a level given by a function that returns dicts)."""
+        names = set(self.fixed)
+        for level in self.levels:
+            if level[0] == 'values':
+                names.add(level[1])
+            elif callable(level[1]):
                 return None
-            first = next(iter(it({}) if callable(it) else it), None)
-            names |= set(first or {})
+            else:
+                for d in level[1]:
+                    names |= set(d)
         return names
 
 
     def _wildcard_iterator(self, parent_wildcards):
-        parent_wildcards = dict(parent_wildcards) if parent_wildcards else {}
-        iterables = [
-            it(parent_wildcards) if callable(it) else iter(it)
-            for it in self.wildcard_iterables
-        ]
-
-        first = None
-
-        for dicts in zip_longest(*iterables, fillvalue=None):
-            if first is None:
-                first = dicts
-
-            merged = dict(parent_wildcards)
-            for i, d in enumerate(dicts):
-                merged.update(d or first[i] or {})
-
-            yield merged
+        current = [{**(dict(parent_wildcards) if parent_wildcards else {}), **self.fixed}]
+        for level in self.levels:
+            nested = []
+            for base in current:
+                if level[0] == 'values':
+                    _, name, values = level
+                    values = values(_Wildcards(base)) if callable(values) else values
+                    if isinstance(values, (str, bytes)) or not hasattr(values, '__iter__'):
+                        raise JobError(f"the function for wildcard '{name}' must return a list of values, "
+                                       f"got {values!r}")
+                    nested += [{**base, name: v} for v in values]
+                else:
+                    dicts = level[1](_Wildcards(base)) if callable(level[1]) else level[1]
+                    for d in dicts:
+                        if not isinstance(d, dict):
+                            raise JobError(f"a loop over a list of dicts got {d!r}, which is not a dict")
+                        unknown = set(d) - set(self.rule._wildcard_names())
+                        if unknown:
+                            raise JobError(f"{type(self.rule).__name__} has no wildcard(s) "
+                                           f"{', '.join(sorted(unknown))}; it has: "
+                                           f"{', '.join(self.rule._wildcard_names()) or 'none'}")
+                        nested.append({**base, **d})
+            current = nested
+        return current
 
 
     def members(self, parent_wildcards=None):
@@ -1327,13 +1766,34 @@ class JobLoop:
             ) from e
 
 
-    def _resolve(self, wildcards, key, parser, failed={}):
+    def _resolve(self, wildcards, key, parser, failed={}, select=()):
         # a failed member's output is its JobError; a parser of the loop gets those as well
-        val = []
-        for wc in self.members(wildcards):
+        members = self.members(wildcards)
+        values = []
+        for wc in members:
             log = self.rule.log_path(wc)
-            val.append(failed[log] if log in failed else self.rule._read_output(JobResult(log), key, wc))
-        val = val[0] if self.scalar else val
+            values.append(failed[log] if log in failed else self.rule._read_output(JobResult(log), key, wc, select))
+        if self.scalar:
+            val = values[0]
+        else:
+            names = self.rule._wildcard_names()
+            field = self.rule.OutputModel.model_fields.get(key) if key else None
+            all_selected = field is not None and select and \
+                set(select) == set(_loop_output_keys(type(self.rule), field))
+            if field is not None and _loop_output_annotation(field.annotation)[0] is not None and not all_selected:
+                # outputs with several files per job: one flat JobLoop over all jobs and files
+                keys = _loop_output_keys(type(self.rule), field)
+                items, wcs = [], []
+                for wc, v in zip(members, values):
+                    if isinstance(v, JobLoop):
+                        items += list(v)
+                        wcs += v._wildcards
+                    elif v is not None:  # a failed job (JobError)
+                        items.append(v)
+                        wcs.append({k: wc[k] for k in names if k in wc})
+                val = JobLoop(items, wcs, names + keys)
+            else:
+                val = JobLoop(values, [_Wildcards({k: wc[k] for k in names if k in wc}) for wc in members], names)
         return _apply_parser(parser, val, wildcards)
 
 
@@ -1461,7 +1921,33 @@ class PipelineBuilder:
                 obj._configure(name,self.config_params.get(obj.__class__.__name__,{}))
                 passed[name] = obj
 
+        # parameters for a class that no rule has: most likely a typo, which would go unnoticed
+        classes = {type(obj).__name__ for obj in passed.values()}
+        unknown = [c for c in self.config_params if c not in classes]
+        if unknown and getattr(namespace.get('workflow'), 'is_main_process', True):
+            import difflib
+            for c in unknown:
+                close = difflib.get_close_matches(c, classes, n=1)
+                hint = f"; did you mean {close[0]}?" if close else ''
+                print(f"Warning: the config has parameters for {c}, but no rule of this pipeline has "
+                      f"that class{hint}", file=sys.stderr)
+
         return passed
+
+
+    def _check_writable_folders(self):
+        """The folders that every run writes in must be writable: Snakemake's own folder, the stamps,
+        the log folder and the results folder. Checked when the Snakefile is loaded, so that a
+        colleague's files that block the run are reported in the console."""
+        blocked = []
+        for folder in ['.snakemake', STAMP_DIR, self.pathvars.get('logs'), self.pathvars.get('results')]:
+            if op.isdir(folder):
+                if not os.access(folder, os.W_OK | os.X_OK):
+                    blocked.append(op.abspath(folder))
+            else:
+                blocked += blocked_paths(folder)
+        if blocked:
+            raise PermissionError(permission_advice(blocked, 'The pipeline cannot run here, because'))
 
 
     def _sync_job_states(self):
@@ -1494,6 +1980,8 @@ class PipelineBuilder:
             return  # another Snakemake process is active: leave everything as it is
 
         outdated = {}  # log path -> bool, for every job visited
+        blocked = {}   # log path -> folders that stop that job from running
+        blocked_maybe = {}  # the same, for jobs that are up to date
 
         owners = {}  # log file or result folder -> the job that uses it
 
@@ -1542,6 +2030,16 @@ class PipelineBuilder:
             outdated[log] = is_outdated
 
             stamp = rule._stamp_path(wildcards)
+            # a job that runs replaces its log and stamp, and removes its previous outputs: for a job
+            # that will run, check all of its folders; for the others (which may still rerun, e.g.
+            # after a parameter change) only the quick checks
+            result = rule.result_path(wildcards)
+            paths = blocked_paths(log) + blocked_paths(stamp)
+            paths += blocked_paths(result[:-1]) if result.endswith('*') else \
+                blocked_paths(result, contents=is_outdated)
+            if paths:
+                (blocked if is_outdated else blocked_maybe).setdefault(log, paths)
+                return is_outdated
             if is_outdated:
                 if op.exists(stamp):
                     os.remove(stamp)
@@ -1556,6 +2054,20 @@ class PipelineBuilder:
         for rule in self.rules.values():
             if not rule._wildcard_names():
                 visit(rule, {})
+
+        def jobs(logs):
+            return ', '.join(op.basename(log) for log in list(logs)[:5]) + (
+                f' ... ({len(logs)} jobs)' if len(logs) > 5 else '')
+        if blocked:
+            raise PermissionError(permission_advice(
+                [p for paths in blocked.values() for p in paths],
+                f'Jobs that need to run ({jobs(blocked)}) cannot replace the files of their previous run, because'))
+        if blocked_maybe:
+            print('Warning: ' + permission_advice(
+                [p for paths in blocked_maybe.values() for p in paths],
+                f'Jobs that are up to date ({jobs(blocked_maybe)}) cannot run again (e.g. after a parameter '
+                f'change, or with -R), and Snakemake would stop with "Write-protected output files", because'),
+                file=sys.stderr)
 
 
     def _upstream_jobs(self, rule, wildcards):
@@ -1575,7 +2087,7 @@ class PipelineBuilder:
             if not isinstance(val, OutputPromise):
                 continue
             source = val.rule_or_loop
-            if isinstance(source, JobLoop):
+            if isinstance(source, LoopPromise):
                 try:
                     members = source.members(wildcards)
                 except Exception:
@@ -1676,6 +2188,8 @@ class PipelineBuilder:
         if self.check_names and self.is_main_process:
             _check_undefined_names(self.rules.values(), self.linemaps)
 
+        if self.is_main_process and not _read_only:
+            self._check_writable_folders()
         self._sync_job_states()
 
         # the default target (for `snakemake` without target name): like in Snakemake, the first
@@ -1705,7 +2219,25 @@ class PipelineBuilder:
             inject_rule(r)
 
 
-def configure(pathvars,config_params=None,env=None,retry_failed=True,check_names=True):
+def _apply_umask_to_snakemake_folder(umask):
+    """Snakemake creates .snakemake/ and its first subfolders before the Snakefile is loaded, so
+    with the umask of the person who runs it. Give those folders the permissions that `umask`
+    allows (only adding, never removing), if they are ours; not recursively, since the folders
+    that snakeplusplus and the jobs create later get the umask anyway."""
+    wanted = 0o777 & ~umask
+    folders = ['.snakemake']
+    if op.isdir('.snakemake'):
+        folders += [e.path for e in os.scandir('.snakemake') if e.is_dir(follow_symlinks=False)]
+    for folder in folders:
+        try:
+            st = os.stat(folder)
+            if st.st_uid == os.geteuid() and (st.st_mode & wanted) != wanted:
+                os.chmod(folder, (st.st_mode & 0o7777) | wanted)
+        except OSError:
+            pass  # the load-time check reports what remains a problem
+
+
+def configure(pathvars,config_params=None,env=None,retry_failed=True,check_names=True,umask=None):
     """Set up snakeplusplus; call it in the Snakefile before the rules are created.
 
     Args:
@@ -1716,6 +2248,10 @@ def configure(pathvars,config_params=None,env=None,retry_failed=True,check_names
         retry_failed: Run jobs again that failed in a previous run (that have an `.error` file).
         check_names: Report names that the rules' methods use but that are not defined, e.g. a
             missing import, when the Snakefile is loaded instead of when the job runs.
+        umask: The umask for everything the pipeline creates, e.g. `0o002` so that the group can
+            write it too, and colleagues can continue the pipeline. It applies to the jobs and the
+            tools they run, whatever the umask of the person who runs the pipeline. Default: that
+            person's own umask.
 
     Example:
         ```python
@@ -1727,6 +2263,17 @@ def configure(pathvars,config_params=None,env=None,retry_failed=True,check_names
         ```
     """
     global _builder
+    if umask is not None:
+        if isinstance(umask, bool) or not isinstance(umask, int) or not 0 <= umask <= 0o777:
+            raise ValueError(f"configure(): umask must be a number like 0o002 (octal), got {umask!r}")
+        os.umask(umask)  # inherited by the job processes and the tools they run
+        _apply_umask_to_snakemake_folder(umask)
+    missing = [name for name in ('logs', 'results') if not pathvars.get(name)]
+    if missing:
+        raise ValueError(f"configure(): pathvars needs {' and '.join(repr(m) for m in missing)}: the folder "
+                         f"for the log files and the folder under which jobs get their result folders, "
+                         f"e.g. configure(dict(logs='logs', results='results')) or, with a pathvars: "
+                         f"section in the Snakefile, configure(workflow.pathvars)")
     _builder = PipelineBuilder(pathvars,config_params or {},env or {},retry_failed,check_names)
 
 
@@ -1745,7 +2292,7 @@ def target(*rules_or_loops):
     inputs = {}
     for i, item in enumerate(rules_or_loops):
         rule = item.rule_or_loop if isinstance(item, OutputPromise) else item
-        if isinstance(rule, JobLoop):
+        if isinstance(rule, LoopPromise):
             rule, given = rule.rule, rule._known_wildcards()
         elif isinstance(rule, SnakeRule):
             given = set()

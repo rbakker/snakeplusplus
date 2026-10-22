@@ -210,13 +210,14 @@ way, together with the lines of your code where it happened.
 ## Step 5: a diagram of the pipeline
 
 ```
-snakeplusplus-doc step3.smk -o pipeline.html
+snakeplusplus-diagram step3.smk
 ```
 
-writes an HTML page with a diagram of the pipeline and, for each rule, its wildcards, inputs,
-outputs and parameters. Nothing is run for this.
+writes `step3-diagram.html`: an HTML page with a diagram of the pipeline and, for each rule, its
+wildcards, inputs, outputs and parameters. Nothing is run for this. Without a file name, it looks
+for the Snakefile the way Snakemake does.
 
-![The tutorial pipeline as drawn by snakeplusplus-doc](img/tutorial-pipeline.png)
+![The tutorial pipeline as drawn by snakeplusplus-diagram](img/tutorial-pipeline.png)
 
 ## Next
 

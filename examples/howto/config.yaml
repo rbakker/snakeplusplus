@@ -1,0 +1,7 @@
+# --8<-- [start:config]
+params:
+  Smooth:
+    width: 3
+  Analyse:
+    min_value: 2
+# --8<-- [end:config]

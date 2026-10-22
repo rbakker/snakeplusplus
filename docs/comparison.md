@@ -328,7 +328,7 @@ expressive. It has a smaller ecosystem than the other two, and version 1.0 is st
 
 - **Rerun decisions are per job, not per file.** Snakemake reruns a job when its parameters
   change (including defaults), when an upstream job produced a newer log, or when it failed in a
-  previous run (switch off with `--config retry_failed=False`). Unlike plain Snakemake, it cannot
+  previous run (switch off with `configure(..., retry_failed=False)`). Unlike plain Snakemake, it cannot
   see that an individual result file was deleted or modified by hand.
 - **Code changes do not trigger reruns, by design.** After fixing a bug that made some jobs fail,
   only those jobs run again, not every job that uses the fixed code. If a bug produced wrong

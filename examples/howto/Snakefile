@@ -1,0 +1,203 @@
+# Number crunching on a few small data files, used for the code fragments on the how-to pages.
+# It runs without external tools other than coreutils (sort, split, uniq); a test runs it.
+import hashlib
+import json
+import os
+import tempfile
+from pathlib import Path
+
+import snakeplusplus
+from snakeplusplus import SnakeRule, target, Field, JobLoop, JobError, PathPrefix
+
+# --8<-- [start:configure]
+configfile: 'config.yaml'
+
+snakeplusplus.configure(dict(logs='logs', results='results'), config.get('params'))
+# --8<-- [end:configure]
+
+SUBJECTS = ['01', '02', '03']
+
+
+# --8<-- [start:smooth]
+class Smooth(SnakeRule):
+    """A moving average of the numbers in a file."""
+    result_template = 'sub-{subject}'
+
+    class InputModel:
+        numbers: Path
+
+    class ParamModel:
+        width: int = Field(1, description='number of values to average')
+        method: str = 'mean'
+
+    class OutputModel:
+        smoothed: Path = Field('smoothed.txt')
+
+    def run(self, job, input, output, params, wildcards):
+        values = [float(x) for x in input.numbers.read_text().split()]
+        averaged = [sum(values[i:i + params.width]) / len(values[i:i + params.width]) for i in range(len(values))]
+        # an intermediate file in the job's temporary folder, deleted when the job ends
+        draft = job.tmpdir() / 'draft.txt'
+        draft.write_text('\n'.join(f'{v:g}' for v in averaged) + '\n')
+        # a unique name, for a tool that wants a file name of its own
+        fd, scratch = tempfile.mkstemp(dir=job.tmpdir(), suffix='.txt')
+        os.close(fd)
+        job.run(['sort', '-g', '-o', scratch, draft])
+        job.run(['cp', draft, output.smoothed])
+# --8<-- [end:smooth]
+
+
+# --8<-- [start:commands]
+class Summarize(SnakeRule):
+    """Sorted values and their counts, made with command line tools."""
+    result_template = 'sub-{subject}'
+    threads_budget = 'cores/2'
+
+    class InputModel:
+        smoothed: Path
+
+    class OutputModel:
+        sorted: Path = Field('sorted.txt')
+        counts: Path = Field('counts.txt')
+
+    def run(self, job, input, output, params, wildcards):
+        # a command as a list: each argument as it is, no quoting needed
+        job.run(['sort', '-g', f'--parallel={job.threads}', '-o', output.sorted, input.smoothed])
+        # a shell script, for pipes and redirection
+        job.shell(f"sort -g {input.smoothed} | uniq -c | awk '{{print $2, $1}}' > {output.counts}")
+        # a long command: its output in the log while it runs, without the progress lines
+        job.run(['sh', '-c', 'for i in 1 2 3; do echo "progress $i"; sleep 1; done; echo finished'],
+                update_interval=1, formatter=lambda lines: '\n'.join(l for l in lines if 'progress' not in l))
+# --8<-- [end:commands]
+
+
+# --8<-- [start:outputs]
+class Analyse(SnakeRule):
+    """Several kinds of outputs from one job."""
+    result_template = 'sub-{subject}'
+
+    class InputModel:
+        smoothed: Path
+
+    class ParamModel:
+        min_value: float = 0
+
+    class OutputModel:
+        mean: float                                         # a value, not a file
+        plots: Path = Field('plots')                        # a folder
+        warnings: Path | None = Field('warnings.txt')       # only when there is something to report
+        parts: PathPrefix = Field('part_')                  # files written by a tool, with this prefix
+        values: JobLoop[Path] = Field('value_{index}.txt')  # one file per key
+        best: Path                                          # a name that is only known at run time
+
+    def run(self, job, input, output, params, wildcards):
+        values = [float(x) for x in input.smoothed.read_text().split()]
+        output(mean=sum(values) / len(values))
+        output.plots.mkdir()
+        (output.plots / 'histogram.txt').write_text('#' * len(values) + '\n')
+        low = [v for v in values if v < params.min_value]
+        if low:
+            output.warnings.write_text(f'{len(low)} values below {params.min_value}\n')
+        job.run(['split', '-l', '2', input.smoothed, output.parts])
+        for i, v in enumerate(values):
+            output.values(index=i).write_text(f'{v:g}\n')
+        best = max(values)
+        output(best=f'best_{best:g}.txt')
+        output.best.write_text(f'{best:g}\n')
+# --8<-- [end:outputs]
+
+
+# --8<-- [start:receive]
+class Inspect(SnakeRule):
+    """What a receiving job gets from those outputs."""
+    result_template = 'sub-{subject}'
+
+    class InputModel:
+        parts: PathPrefix
+        values: JobLoop[Path]
+        warnings: Path | None
+
+    class OutputModel:
+        overview: Path = Field('overview.json')
+
+    def run(self, job, input, output, params, wildcards):
+        json.dump(dict(parts=[Path(p).name for p in input.parts.matches()],
+                       values={wc.index: p.read_text().strip() for wc, p in input.values.items()},
+                       warnings=input.warnings is not None),
+                  open(output.overview, 'w'), indent=2)
+# --8<-- [end:receive]
+
+
+# --8<-- [start:group]
+class GroupMean(SnakeRule):
+    """The mean over subjects, without the subjects whose analysis failed."""
+    class InputModel:
+        means: JobLoop[float | JobError]
+
+    class OutputModel:
+        table: Path = Field('group.json')
+
+    def run(self, job, input, output, params, wildcards):
+        ok = {wc.subject: m for wc, m in input.means.items() if not isinstance(m, JobError)}
+        failed = [wc.subject for wc, m in input.means.items() if isinstance(m, JobError)]
+        if failed:
+            job.log(f'Left out, because their analysis failed: {", ".join(failed)}')
+        if not ok:
+            raise JobError('the analysis failed for all subjects')
+        json.dump(dict(mean=sum(ok.values()) / len(ok), subjects=sorted(ok), left_out=failed),
+                  open(output.table, 'w'), indent=2)
+# --8<-- [end:group]
+
+
+# --8<-- [start:cache]
+class Model(SnakeRule):
+    """A result that is costly to compute, kept in a cache that survives reruns."""
+    result_template = 'sub-{subject}'
+
+    class InputModel:
+        smoothed: Path
+
+    class ParamModel:
+        label: str = 'model'   # changing it reruns the job, but the model can be reused
+
+    class OutputModel:
+        model: Path = Field('model.txt')
+
+    def run(self, job, input, output, params, wildcards):
+        # the name says what the model depends on: the subject, and a checksum of the input
+        checksum = hashlib.sha1(input.smoothed.read_bytes()).hexdigest()[:8]
+        cache = Path('cache') / f'sub-{wildcards.subject}-{checksum}.txt'
+        if cache.exists():
+            job.log(f'Reusing {cache}')
+        else:
+            cache.parent.mkdir(exist_ok=True)
+            cache.write_text(f'{sum(float(x) for x in input.smoothed.read_text().split()):g}\n')  # the costly part
+        output.model.symlink_to(cache.resolve())
+# --8<-- [end:cache]
+
+
+# --8<-- [start:graph]
+smooth = Smooth().set_input(numbers='data/sub-{subject}.txt')
+smooth_wide = Smooth(width=9).set_input(numbers='data/sub-{subject}.txt')
+summarize = Summarize().set_input(smoothed=smooth.get_output('smoothed'))
+analyse = Analyse().set_input(smoothed=smooth.get_output('smoothed'))
+inspect = Inspect().set_input(parts=analyse.get_output('parts'), values=analyse.get_output('values'),
+                              warnings=analyse.get_output('warnings'))
+group_mean = GroupMean().set_input(means=analyse.foreach(subject=SUBJECTS).get_output('mean'))
+model = Model().set_input(smoothed=smooth.get_output('smoothed'))
+# --8<-- [end:graph]
+
+# --8<-- [start:manual]
+def smoothed_or_manual(wildcards):
+    """A hand-corrected file when there is one, otherwise the output of smooth."""
+    manual = f'manual/sub-{wildcards.subject}-smoothed.txt'
+    return manual if os.path.exists(manual) else smooth.get_output('smoothed')
+
+model_checked = Model(label='checked').set_input(smoothed=smoothed_or_manual)
+# --8<-- [end:manual]
+
+everything = target(group_mean, smooth_wide.foreach(subject=['01']),
+                    summarize.foreach(subject=['01', '02']), inspect.foreach(subject=['01', '02']),
+                    model.foreach(subject=['01', '02']), model_checked.foreach(subject=['01', '02']))
+
+snakeplusplus.build(locals())

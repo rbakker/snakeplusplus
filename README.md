@@ -2,6 +2,8 @@
 
 Modular, object-oriented pipelines on top of [Snakemake](https://snakemake.readthedocs.io).
 
+**Documentation: <https://rbakker.github.io/snakeplusplus/>**
+
 ## Why Snake++
 
 [Snakemake](https://snakemake.readthedocs.io) is a great tool for running data processing
@@ -20,7 +22,7 @@ stops the run: fix the cause, run again, and only what failed is redone.
   a `result_template` that says where each job writes; they can be reused, inherited and documented.
 - **Rules are connected explicitly** with `set_input(x=other.get_output('y'))` and
   `foreach(...)`; connection mistakes are caught before anything runs.
-- **One log file per job is the only thing Snakemake tracks.** Its extension shows the job's
+- **One log file per job tells what happened.** Snakemake's bookkeeping is derived from it. Its extension shows the job's
   state (`.queued`, `.running`, `.log`, `.error`, `.stale`), so the log folder is a live overview of the
   pipeline. Delete a log file to rerun that job.
 - **Errors never crash the run.** A failed job leaves an `.error` file; jobs that depend on it
@@ -62,11 +64,12 @@ pip install snakeplusplus
 
 For development: `pip install -e ".[test]"`, then `pytest`.
 
-## Documentation of a pipeline
+## A diagram of a pipeline
 
 ```
-snakeplusplus-doc path/to/Snakefile -o docs/pipeline.html
+snakeplusplus-diagram path/to/Snakefile
 ```
 
-generates an HTML overview of the pipeline: a diagram of the rules and how they are connected,
-and a reference of each rule's wildcards, inputs, outputs and parameters.
+writes `<Snakefile name>-diagram.html`: a diagram of the rules and how they are connected, and a
+reference of each rule's wildcards, inputs, outputs and parameters. Without a path, it finds the
+Snakefile the way Snakemake does.

@@ -1,4 +1,5 @@
 site_name: Snake++
+site_url: https://rbakker.github.io/snakeplusplus/
 site_description: Modular, object-oriented pipelines on top of Snakemake
 repo_url: https://github.com/rbakker/snakeplusplus
 repo_name: rbakker/snakeplusplus
@@ -68,6 +69,7 @@ nav:
       - Temporary files: how-to/temporary-files.md
       - Reuse costly results: how-to/reuse-results.md
       - Document a pipeline: how-to/pipeline-documentation.md
+      - Share a pipeline with colleagues: how-to/shared-pipeline.md
   - Comparison with other tools: comparison.md
   - Limitations: limitations.md
   - Reference: reference.md

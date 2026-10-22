@@ -8,11 +8,15 @@ Everything that `from snakeplusplus import *` provides. `Field` and `Json` are p
 
 ::: snakeplusplus.SnakeRule
     options:
-      members: [__init__, set_input, get_output, foreach, run, log_path, result_path, describe]
+      members: [__init__, set_input, get_output, foreach, where, run, log_path, result_path, describe]
 
 ::: snakeplusplus.SnakeCheckpoint
     options:
       members: false
+
+::: snakeplusplus.OutputPromise
+    options:
+      members: [when]
 
 ## Models
 
@@ -45,6 +49,10 @@ Everything that `from snakeplusplus import *` provides. `Field` and `Json` are p
 ::: snakeplusplus.JobResult
     options:
       members: [from_checkpoint]
+
+::: snakeplusplus.JobLoop
+    options:
+      members: [from_pattern, items, where, get, groupby, to_pandas]
 
 ::: snakeplusplus.JobError
     options:

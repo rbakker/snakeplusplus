@@ -5,6 +5,7 @@
 import json
 import os
 import subprocess
+import shutil
 import sys
 from pathlib import Path
 
@@ -293,7 +294,7 @@ def test_dry_run(tmp_path):
 
 def test_documentation(tmp_path):
     out = tmp_path / 'pipeline.html'
-    p = subprocess.run(['snakeplusplus-doc', str(SNAKEFILE), '-o', str(out)],
+    p = subprocess.run(['snakeplusplus-diagram', str(SNAKEFILE), '-o', str(out)],
                        capture_output=True, text=True, cwd=tmp_path)
     assert p.returncode == 0, p.stderr
     page = out.read_text()
@@ -354,7 +355,9 @@ def test_jobresult_as_input_type():
             one: JobResult
 
     up = Upstream()
-    Downstream().set_input(one=up, many=up.foreach(subject=['a', 'b']))   # rule / loop -> JobResult(s)
+    Downstream().set_input(one=up.where(subject='a'), many=up.foreach(subject=['a', 'b']))   # one job / loop -> JobResult(s)
+    with pytest.raises(TypeError, match='neither the connection nor Downstream provides'):
+        Downstream().set_input(one=up, many=up.foreach(subject=['a', 'b']))   # which subject?
     with pytest.raises(TypeError):
         Mismatch().set_input(one=up.foreach(subject=['a', 'b']))          # list where one is expected
 
@@ -905,7 +908,7 @@ class Count(SnakeRule):
         open(output.n, 'w').write(str(len(input.prefix.matches())))
 
 track = Track()
-count = Count().set_input(prefix=track.foreach(tract='AF', hemi='L').get_output('prefix'))
+count = Count().set_input(prefix=track.where(tract='AF', hemi='L').get_output('prefix'))
 everything = target(count)
 """
 
@@ -1045,7 +1048,7 @@ class Track(SnakeRule):
         open(output.tracts, 'w').write('x')
 
 track = Track()
-everything = target(track.foreach(subject=['01', '01'], tract=['AF', 'AF'], hemi=['L', 'R']))
+everything = target(track.where(subject='01', tract='AF').foreach(hemi=['L', 'R']))
 """
 
 
@@ -1094,8 +1097,8 @@ def test_wildcard_value_with_slash(tmp_path):
 def test_two_jobs_with_the_same_log_name(tmp_path):
     # subject 'a_ses-1' with session '2', and subject 'a' with session '1_ses-2'
     snakefile = TEMPLATE_SNAKEFILE.replace("'sub-{subject}/tract-{tract}/{hemi}_*'", "'sub-{subject}_ses-{tract}/{hemi}_*'") \
-        .replace("subject=['01', '01'], tract=['AF', 'AF'], hemi=['L', 'R']",
-                 "subject=['a_ses-1', 'a'], tract=['2', '1_ses-2'], hemi=['L', 'L']")
+        .replace("track.where(subject='01', tract='AF').foreach(hemi=['L', 'R'])",
+                 "track.foreach([dict(subject='a_ses-1', tract='2', hemi='L'), dict(subject='a', tract='1_ses-2', hemi='L')])")
     p = run_targets(tmp_path, snakefile, '-n')
     assert p.returncode != 0
     assert "Two jobs would use the same log file" in p.stdout + p.stderr
@@ -1250,3 +1253,685 @@ def test_tutorial_named_target_and_typo(tmp_path):
                        capture_output=True, text=True)
     assert p.returncode != 0
     assert 'line 48:' in p.stdout + p.stderr and "SayHello has no output 'txt'" in p.stdout + p.stderr
+
+
+def test_foreach_and_where_forms():
+    from snakeplusplus import SnakeRule
+
+    class Step(SnakeRule):
+        result_template = 'sub-{subject}/ses-{session}'
+
+    step = Step()
+    with pytest.raises(TypeError, match=r"one wildcard at a time.*\.foreach\(subject=\[\.\.\.\]\)\.foreach\(session=\[\.\.\.\]\)"):
+        step.foreach(subject=['01'], session=['a'])
+    with pytest.raises(TypeError, match=r"single value; use \.where\(subject='01'\)"):
+        step.foreach(subject='01')
+    with pytest.raises(TypeError, match="has no wildcard 'hemi'"):
+        step.foreach(hemi=['L'])
+    with pytest.raises(TypeError, match="has no wildcard"):
+        step.foreach([dict(subject='01', hemi='L')])
+    with pytest.raises(TypeError, match="either one wildcard"):
+        step.foreach([dict(subject='01')], session=['a'])
+    with pytest.raises(TypeError, match=r"needs a single value; use \.foreach\(session=\[\.\.\.\]\)"):
+        step.where(session=['a', 'b'])
+    with pytest.raises(ValueError, match="without '/'"):
+        step.foreach(subject=['a/b'])
+    # valid forms
+    loop = step.where(subject='01').foreach(session=['a', 'b'])
+    assert loop.members({}) == [{'subject': '01', 'session': 'a'}, {'subject': '01', 'session': 'b'}]
+    loop = step.foreach(subject=['01', '02']).foreach(session=lambda wc: ['x'] if wc.subject == '01' else ['y', 'z'])
+    assert loop.members({}) == [{'subject': '01', 'session': 'x'}, {'subject': '02', 'session': 'y'},
+                                {'subject': '02', 'session': 'z'}]
+    assert step.foreach([dict(subject='01', session='a')]).members({}) == [{'subject': '01', 'session': 'a'}]
+    assert step.where(subject='01', session='a').scalar
+
+
+def test_job_loop_methods():
+    from snakeplusplus import JobLoop
+    from snakeplusplus import _Wildcards
+    wcs = [_Wildcards(subject=s, session=t) for s, t in [('01', 'a'), ('01', 'b'), ('02', 'a')]]
+    loop = JobLoop(['p', 'q', 'r'], wcs, ['subject', 'session'])
+    assert loop == ['p', 'q', 'r'] and isinstance(loop, list)
+    assert [(wc.subject, v) for wc, v in loop.items()] == [('01', 'p'), ('01', 'q'), ('02', 'r')]
+    assert loop.where(session='a') == ['p', 'r']
+    assert loop.get(subject='01', session='b') == 'q'
+    assert {k: list(v) for k, v in loop.groupby('subject').items()} == {'01': ['p', 'q'], '02': ['r']}
+    with pytest.raises(KeyError, match="expected exactly one"):
+        loop.get(subject='01')
+    with pytest.raises(KeyError, match="no wildcard"):
+        loop.where(hemi='L')
+
+
+def test_job_loop_to_pandas():
+    pytest.importorskip('pandas')
+    from snakeplusplus import JobLoop, _Wildcards
+    loop = JobLoop(['p', 'q'], [_Wildcards(subject='01'), _Wildcards(subject='02')], ['subject'])
+    table = loop.to_pandas()
+    assert list(table.columns) == ['subject', 'value'] and table.value.tolist() == ['p', 'q']
+
+
+NESTED_SNAKEFILE = """
+import json
+from pathlib import Path
+import snakeplusplus
+from snakeplusplus import SnakeRule, target, Field, JobLoop
+pathvars:
+    logs = 'logs',
+    results = 'results'
+snakeplusplus.configure(workflow.pathvars)
+
+SESSIONS = {'01': ['pre', 'post'], '02': ['pre']}
+
+class Scan(SnakeRule):
+    result_template = 'sub-{subject}/ses-{session}'
+    class OutputModel:
+        value: Path = Field('value.txt')
+    def run(self, job, input, output, params, wildcards):
+        open(output.value, 'w').write(wildcards.subject + wildcards.session)
+
+class PerSubject(SnakeRule):
+    result_template = 'sub-{subject}'
+    class InputModel:
+        scans: JobLoop[Path]
+    class OutputModel:
+        summary: Path = Field('summary.json')
+    def run(self, job, input, output, params, wildcards):
+        json.dump({wc.session: open(v).read() for wc, v in input.scans.items()}, open(output.summary, 'w'))
+
+class Group(SnakeRule):
+    class InputModel:
+        scans: JobLoop[Path]
+        plain: list[Path]
+    class OutputModel:
+        summary: Path = Field('summary.json')
+    def run(self, job, input, output, params, wildcards):
+        json.dump({
+            'pre': [open(v).read() for v in input.scans.where(session='pre')],
+            'one': open(input.scans.get(subject='01', session='post')).read(),
+            'groups': {k: len(v) for k, v in input.scans.groupby('subject').items()},
+            'plain_type': type(input.plain).__name__,
+        }, open(output.summary, 'w'))
+
+scan = Scan()
+per_subject = PerSubject().set_input(scans=scan.foreach(session=lambda wc: SESSIONS[wc.subject]).get_output('value'))
+all_scans = scan.foreach(subject=['01', '02']).foreach(session=lambda wc: SESSIONS[wc.subject]).get_output('value')
+group = Group().set_input(scans=all_scans, plain=all_scans)
+everything = target(group, per_subject.foreach(subject=['01', '02']))
+"""
+
+
+def test_nested_loops_and_job_loop_input(tmp_path):
+    p = run_targets(tmp_path, NESTED_SNAKEFILE)
+    assert p.returncode == 0, p.stdout + p.stderr
+    per_subject = json.loads((tmp_path / 'results/sub-01/per_subject/summary.json').read_text())
+    assert per_subject == {'pre': '01pre', 'post': '01post'}  # wildcards passed on from the receiving job
+    group = json.loads((tmp_path / 'results/group/summary.json').read_text())
+    assert group == {'pre': ['01pre', '02pre'], 'one': '01post', 'groups': {'01': 2, '02': 1}, 'plain_type': 'list'}
+
+
+def test_connection_must_provide_all_wildcards(tmp_path):
+    p = run_targets(tmp_path, NESTED_SNAKEFILE.replace(
+        "group = Group().set_input(scans=all_scans, plain=all_scans)",
+        "group = Group().set_input(scans=scan.foreach(subject=['01']).get_output('value'), plain=all_scans)"), '-n')
+    assert p.returncode != 0
+    assert ("Group.scans: Scan has wildcard(s) {session}, which neither the connection nor Group provides"
+            in p.stdout + p.stderr)
+
+
+def test_misspelled_model_and_unknown_output(tmp_path):
+    from snakeplusplus import SnakeRule, Fixed, Field
+    with pytest.raises(TypeError, match="did you mean OutputModel"):
+        class Rule_fbcfilter(SnakeRule):
+            class outputModel(Fixed):
+                pruned: Path = Field('fbc_pruned.tck')
+    # in run(): an output that does not exist is an error, not None
+    p = run_targets(tmp_path, THREADS_SNAKEFILE.replace("open(output.n, 'w')", "open(output.nn, 'w')"))
+    assert p.returncode == 0, p.stdout + p.stderr
+    error = (tmp_path / 'logs/tool.error').read_text()
+    assert "there is no output 'nn'; the outputs of this rule are: n" in error
+
+
+FOREIGN_SNAKEFILE = """
+import json
+from pathlib import Path
+import snakeplusplus
+from snakeplusplus import SnakeRule, target, Field, JobLoop
+pathvars:
+    logs = 'logs',
+    results = 'results'
+snakeplusplus.configure(workflow.pathvars)
+
+class Group(SnakeRule):
+    class InputModel:
+        fa: JobLoop[Path]
+    class OutputModel:
+        summary: Path = Field('summary.json')
+    def run(self, job, input, output, params, wildcards):
+        json.dump({'items': [[wc.subject, wc.session, open(v).read()] for wc, v in input.fa.items()],
+                   'pre': len(input.fa.where(session='pre'))}, open(output.summary, 'w'))
+
+class PerSubject(SnakeRule):
+    result_template = 'sub-{subject}'
+    class InputModel:
+        fa: JobLoop[Path]
+    class OutputModel:
+        sessions: Path = Field('sessions.txt')
+    def run(self, job, input, output, params, wildcards):
+        open(output.sessions, 'w').write(' '.join(wc.session for wc, _ in input.fa.items()))
+
+group = Group().set_input(fa=JobLoop.from_pattern('other/sub-{subject}/ses-{session}/fa.txt'))
+per_subject = PerSubject().set_input(
+    fa=lambda wildcards: JobLoop.from_pattern(f'other/sub-{wildcards.subject}/ses-{{session}}/fa.txt'))
+everything = target(group, per_subject.foreach(subject=['01', '02']))
+"""
+
+
+def test_job_loop_from_files_of_another_pipeline(tmp_path, monkeypatch):
+    for sub, ses in [('01', 'pre'), ('01', 'post'), ('02', 'pre')]:
+        f = tmp_path / 'other' / f'sub-{sub}' / f'ses-{ses}' / 'fa.txt'
+        f.parent.mkdir(parents=True)
+        f.write_text(sub + ses)
+    (tmp_path / 'other/sub-01/ses-pre/notes.txt').write_text('not matched')
+    monkeypatch.chdir(tmp_path)  # the Snakefile is parsed with this working directory
+    p = run_targets(tmp_path, FOREIGN_SNAKEFILE)
+    assert p.returncode == 0, p.stdout + p.stderr
+    summary = json.loads((tmp_path / 'results/group/summary.json').read_text())
+    assert summary == {'items': [['01', 'post', '01post'], ['01', 'pre', '01pre'], ['02', 'pre', '02pre']], 'pre': 2}
+    assert (tmp_path / 'results/sub-01/per_subject/sessions.txt').read_text() == 'post pre'
+    assert (tmp_path / 'results/sub-02/per_subject/sessions.txt').read_text() == 'pre'
+
+
+def test_diagram_default_output_and_snakefile_search(tmp_path):
+    from snakeplusplus.diagram import default_output
+    assert default_output('/p/workflow/Snakefile') == '/p/Snakefile-diagram.html'
+    assert default_output('/p/workflow/drt.smk') == '/p/drt-diagram.html'
+    assert default_output('/p/other/drt.smk') == '/p/other/drt-diagram.html'
+    (tmp_path / 'workflow').mkdir()
+    (tmp_path / 'workflow' / 'Snakefile').write_text((TUTORIAL / 'step3.smk').read_text())
+    (tmp_path / 'workflow' / 'greetings.csv').write_text((TUTORIAL / 'greetings.csv').read_text())
+    p = subprocess.run(['snakeplusplus-diagram'], capture_output=True, text=True, cwd=tmp_path)
+    assert p.returncode == 0, p.stderr
+    page = (tmp_path / 'Snakefile-diagram.html').read_text()
+    assert 'collect_greetings' in page and "if (!e.textContent.trim()) e.style.display = 'none'" in page
+
+
+def test_concepts_example_loads(tmp_path):
+    # the code fragments on the concept pages come from this file: all its connections must check out
+    out = tmp_path / 'dwi.html'
+    p = subprocess.run(['snakeplusplus-diagram', str(HERE.parent / 'examples/concepts/dwi.smk'), '-o', str(out)],
+                       capture_output=True, text=True, cwd=tmp_path)
+    assert p.returncode == 0, p.stdout + p.stderr
+    page = out.read_text()
+    for rule in ['denoise', 'denoise_wide', 'fit', 'mean_fa', 'group', 'track', 'filter_tracts']:
+        assert f'<b>{rule}</b>' in page
+
+
+def test_clear_messages_for_wrong_input_names_and_parsers():
+    from snakeplusplus import SnakeRule, Field
+    from pathlib import Path
+
+    class Up(SnakeRule):
+        class OutputModel:
+            out: Path = Field('out.txt')
+
+    class Count(SnakeRule):
+        class InputModel:
+            n: int
+
+    def no_hints(path):
+        return 1
+
+    with pytest.raises(ValueError, match=r"Count.set_input\(\): unknown inputs: m; missing inputs: n. The inputs are: n"):
+        Count().set_input(m=3)
+    with pytest.raises(TypeError, match=r"Parser no_hints\(\) needs type hints"):
+        Count().set_input(n=Up().get_output('out', parser=no_hints))
+
+
+LOOP_OUTPUT_SNAKEFILE = """
+import json
+from pathlib import Path
+import snakeplusplus
+from snakeplusplus import SnakeRule, target, Field, JobLoop
+pathvars:
+    logs = 'logs',
+    results = 'results'
+snakeplusplus.configure(workflow.pathvars, config.get('params', {}))
+
+class Sweep(SnakeRule):
+    result_template = 'sub-{subject}'
+    class OutputModel:
+        tracts: JobLoop[Path] = Field('tract_{param}.txt')
+    class ParamModel:
+        values: list[str] = ['1', '2', '3']
+        by_tool: bool = False
+    def run(self, job, input, output, params, wildcards):
+        if params.by_tool:  # a 'tool' that writes the files itself, given the prefix
+            for v in params.values:
+                open(f'{output.tracts.prefix}{v}.txt', 'w').write(wildcards.subject + v)
+        else:
+            for v in params.values:
+                open(output.tracts(param=v), 'w').write(wildcards.subject + v)
+
+class PerSubject(SnakeRule):
+    result_template = 'sub-{subject}'
+    class InputModel:
+        tracts: JobLoop[Path]
+    class OutputModel:
+        summary: Path = Field('summary.json')
+    def run(self, job, input, output, params, wildcards):
+        json.dump({wc.param: open(v).read() for wc, v in input.tracts.items()}, open(output.summary, 'w'))
+
+class Group(SnakeRule):
+    class InputModel:
+        tracts: JobLoop[Path]
+    class OutputModel:
+        summary: Path = Field('summary.json')
+    def run(self, job, input, output, params, wildcards):
+        json.dump({'n': len(input.tracts), 'one': open(input.tracts.get(subject='02', param='3')).read(),
+                   'by_param': {k: len(v) for k, v in input.tracts.groupby('param').items()}},
+                  open(output.summary, 'w'))
+
+sweep = Sweep()
+per_subject = PerSubject().set_input(tracts=sweep.get_output('tracts'))
+group = Group().set_input(tracts=sweep.foreach(subject=['01', '02']).get_output('tracts'))
+everything = target(group, per_subject.foreach(subject=['01', '02']))
+"""
+
+
+def test_output_with_several_files(tmp_path):
+    def run(params=None):
+        return run_targets(tmp_path, LOOP_OUTPUT_SNAKEFILE, '--config', f'params={json.dumps(params or {})}')
+    p = run()
+    assert p.returncode == 0, p.stdout + p.stderr
+    log = (tmp_path / 'logs/sub-01_sweep.log').read_text()
+    assert "Output 'tracts': tract_1.txt, tract_2.txt, tract_3.txt" in log
+    assert '"keys": {' in log and '"param": "2"' in log
+    assert json.loads((tmp_path / 'results/sub-01/per_subject/summary.json').read_text()) == {'1': '011', '2': '012', '3': '013'}
+    group = json.loads((tmp_path / 'results/group/summary.json').read_text())
+    assert group == {'n': 6, 'one': '023', 'by_param': {'1': 2, '2': 2, '3': 2}}  # flattened over subjects
+
+    # rerun, now written by a 'tool' with fewer values: found by their names; old files removed
+    p = run({'Sweep': {'values': ['5', '6'], 'by_tool': True}})
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert sorted(f.name for f in (tmp_path / 'results/sub-01/sweep').iterdir()) == ['tract_5.txt', 'tract_6.txt']
+    assert json.loads((tmp_path / 'results/sub-01/per_subject/summary.json').read_text()) == {'5': '015', '6': '016'}
+
+    # nothing produced: the output is missing
+    p = run({'Sweep': {'values': [], 'by_tool': True}})
+    assert 'tracts: results/sub-01/sweep/tract_{param}.txt (no files with this pattern were created)' in \
+        (tmp_path / 'logs/sub-01_sweep.error').read_text()
+
+
+def test_loop_output_needs_a_key():
+    from snakeplusplus import SnakeRule, JobLoop, Field
+    with pytest.raises(TypeError, match="needs a file name pattern with at least one key"):
+        class Bad(SnakeRule):
+            result_template = 'sub-{subject}'
+            class OutputModel:
+                tracts: JobLoop[Path] = Field('tract_{subject}.tck')   # only a wildcard, no key
+
+
+KEYS_AS_WILDCARDS_SNAKEFILE = """
+from pathlib import Path
+import snakeplusplus
+from snakeplusplus import SnakeRule, target, Field, JobLoop
+snakeplusplus.configure(dict(logs='logs', results='results'))
+
+class Split(SnakeRule):
+    result_template = 'sub-{subject}'
+    class OutputModel:
+        tracts: JobLoop[Path] = Field('tract_{hemi}.txt')
+    def run(self, job, input, output, params, wildcards):
+        for h in ['L', 'R']:
+            output.tracts(hemi=h).write_text(h + wildcards.subject)   # a Path inside run()
+
+class PerHemi(SnakeRule):
+    result_template = 'sub-{subject}/hemi-{hemi}'
+    class InputModel:
+        tract: Path
+    class OutputModel:
+        out: Path = Field('out.txt')
+    def run(self, job, input, output, params, wildcards):
+        output.out.write_text(input.tract.read_text())
+
+class AllHemis(SnakeRule):
+    result_template = 'sub-{subject}'
+    class InputModel:
+        tracts: JobLoop[Path]
+    class OutputModel:
+        out: Path = Field('all.txt')
+    def run(self, job, input, output, params, wildcards):
+        output.out.write_text(','.join(f'{wc.hemi}:{p.read_text()}' for wc, p in input.tracts.items()))
+
+class Group(SnakeRule):
+    result_template = 'group/hemi-{hemi}'
+    class InputModel:
+        tracts: JobLoop[Path]
+    class OutputModel:
+        out: Path = Field('group.txt')
+    def run(self, job, input, output, params, wildcards):
+        output.out.write_text(','.join(f'{wc.subject}:{p.read_text()}' for wc, p in input.tracts.items()))
+
+split = Split()
+per_hemi = PerHemi().set_input(tract=split.get_output('tracts'))
+all_hemis = AllHemis().set_input(tracts=split.get_output('tracts'))
+group = Group().set_input(tracts=split.foreach(subject=['01', '02']).get_output('tracts'))
+everything = target(per_hemi.foreach(subject=['01']).foreach(hemi=['L', 'R', 'X']),
+                    all_hemis.foreach(subject=['01']), group.foreach(hemi=['L', 'R']))
+"""
+
+
+def test_keys_are_filled_in_by_the_receiving_wildcards(tmp_path):
+    run_targets(tmp_path, KEYS_AS_WILDCARDS_SNAKEFILE)
+    def read(name):
+        return (tmp_path / 'results' / name).read_text()
+    assert read('sub-01/hemi-L/per_hemi/out.txt') == 'L01'          # one file: a Path
+    assert read('sub-01/hemi-R/per_hemi/out.txt') == 'R01'
+    assert read('sub-01/all_hemis/all.txt') == 'L:L01,R:R01'         # no {hemi}: all files
+    assert read('group/hemi-L/group/group.txt') == '01:L01,02:L02'   # loop over subjects, one hemi
+    error = (tmp_path / 'logs/sub-01_hemi-X_per_hemi.error').read_text()
+    assert "Split did not produce 'tracts' for hemi=X (it made: L, R" in error
+
+
+def test_keys_filled_in_change_the_input_type():
+    from snakeplusplus import SnakeRule, Field, JobLoop
+
+    class Split(SnakeRule):
+        result_template = 'sub-{subject}'
+        class OutputModel:
+            tracts: JobLoop[Path] = Field('tract_{hemi}_{param}.txt')
+
+    class PerHemiWantsAll(SnakeRule):
+        result_template = 'sub-{subject}/hemi-{hemi}'
+        class InputModel:
+            tracts: JobLoop[Path]
+
+    class PerHemiWantsOne(SnakeRule):
+        result_template = 'sub-{subject}/hemi-{hemi}'
+        class InputModel:
+            tract: Path
+
+    class PerBoth(SnakeRule):
+        result_template = 'sub-{subject}/hemi-{hemi}/param-{param}'
+        class InputModel:
+            tract: Path
+
+    split = Split()
+    PerHemiWantsAll().set_input(tracts=split.get_output('tracts'))   # param is left: still a JobLoop
+    with pytest.raises(TypeError, match="produces .*JobLoop"):
+        PerHemiWantsOne().set_input(tract=split.get_output('tracts'))
+    promise = PerBoth().set_input(tract=split.get_output('tracts')).inputs['tract']
+    assert promise.select == ('hemi', 'param') and promise.annotation is Path
+
+
+def test_configure_needs_logs_and_results():
+    import snakeplusplus
+    with pytest.raises(ValueError, match="pathvars needs 'logs'"):
+        snakeplusplus.configure(dict(results='results'))
+
+
+CONDITIONAL_INPUT_SNAKEFILE = """
+from pathlib import Path
+import snakeplusplus
+from snakeplusplus import SnakeRule, target, Field
+snakeplusplus.configure(dict(logs='logs', results='results'), config.get('params', {}))
+
+class Expensive(SnakeRule):
+    result_template = 'sub-{subject}'
+    class OutputModel:
+        x: Path = Field('x.txt')
+    def run(self, job, input, output, params, wildcards):
+        output.x.write_text('alt')
+
+class Fit(SnakeRule):
+    result_template = 'sub-{subject}'
+    class ParamModel:
+        use_alt: bool = False
+    class InputModel:
+        extra: Path | None = None
+    class OutputModel:
+        out: Path = Field('out.txt')
+    def run(self, job, input, output, params, wildcards):
+        output.out.write_text(input.extra.read_text() if params.use_alt else f'plain {input.extra}')
+
+expensive = Expensive()
+fit = Fit().set_input(extra=expensive.get_output('x').when(use_alt=True))
+per_job = Fit(use_alt=lambda wildcards: wildcards.subject == '02').set_input(
+    extra=expensive.get_output('x').when(use_alt=True))
+everything = target(fit.foreach(subject=['01']))
+both = target(per_job.foreach(subject=['01', '02']))
+"""
+
+
+def test_conditional_input(tmp_path):
+    p = run_targets(tmp_path, CONDITIONAL_INPUT_SNAKEFILE)
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert jobs_run(p) == ['everything', 'fit']                  # the expensive job is not needed
+    assert (tmp_path / 'results/sub-01/fit/out.txt').read_text() == 'plain None'
+
+    # switched on in the config: the expensive job runs, and fit reruns
+    p = run_targets(tmp_path, CONDITIONAL_INPUT_SNAKEFILE, '--config', 'params={"Fit": {"use_alt": true}}')
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert sorted(jobs_run(p)) == ['everything', 'expensive', 'fit']
+    assert (tmp_path / 'results/sub-01/fit/out.txt').read_text() == 'alt'
+
+    # a parameter per job
+    p = run_targets(tmp_path, CONDITIONAL_INPUT_SNAKEFILE, 'both')
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert (tmp_path / 'results/sub-01/per_job/out.txt').read_text() == 'plain None'
+    assert (tmp_path / 'results/sub-02/per_job/out.txt').read_text() == 'alt'
+    assert jobs_run(p).count('expensive') == 1                   # only for subject 02, not again for 01
+
+
+def test_conditional_input_is_checked_when_loaded():
+    from snakeplusplus import SnakeRule, Field
+
+    class Up(SnakeRule):
+        class OutputModel:
+            x: Path = Field('x.txt')
+
+    class Fit(SnakeRule):
+        class ParamModel:
+            use_alt: bool = False
+        class InputModel:
+            extra: Path
+
+    class FitOptional(Fit):
+        class InputModel:
+            extra: Path | None = None
+
+    up = Up()
+    with pytest.raises(TypeError, match=r"Fit.extra is connected with when\(\), so it is None .* `extra: Path \| None = None`"):
+        Fit().set_input(extra=up.get_output('x').when(use_alt=True))
+    with pytest.raises(TypeError, match=r"when\(use_alt2=...\) is not a parameter of FitOptional; its parameters are: use_alt"):
+        FitOptional().set_input(extra=up.get_output('x').when(use_alt2=True))
+    with pytest.raises(TypeError, match=r"when\(use_alt='maybe'\) is not a valid value"):
+        FitOptional().set_input(extra=up.get_output('x').when(use_alt='maybe'))
+
+
+def test_configure_umask():
+    import os
+    import snakeplusplus
+    old = os.umask(0o022)
+    try:
+        snakeplusplus.configure(dict(logs='logs', results='results'), umask=0o002)
+        assert os.umask(0o022) == 0o002
+        with pytest.raises(ValueError, match="umask must be a number like 0o002"):
+            snakeplusplus.configure(dict(logs='logs', results='results'), umask='002')
+    finally:
+        os.umask(old)
+
+
+SHARED_SNAKEFILE = """
+from pathlib import Path
+import snakeplusplus
+from snakeplusplus import SnakeRule, Field, target
+snakeplusplus.configure(dict(results='results', logs='logs'), config.get('params', {}),
+                        umask=config.get('umask'))
+
+class Hello(SnakeRule):
+    result_template = 'sub-{subject}'
+    class ParamModel:
+        greeting: str = 'hello'
+    class OutputModel:
+        out: Path = Field('hello.txt')
+    def run(self, job, input, output, params, wildcards):
+        output.out.write_text(params.greeting)
+
+hello = Hello()
+everything = target(hello.foreach(subject=['01', '02']))
+snakeplusplus.build(locals())
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0 or not shutil.which('setpriv'),
+                    reason='needs root and setpriv, to run the pipeline as two different users')
+def test_two_users_share_a_pipeline():
+    import tempfile
+    shared_gid = 100  # both users are in this group
+    alice, bob = 54321, 54322
+
+    def run_as(uid, folder, *args, umask='022'):
+        cmd = f"umask {umask}; {sys.executable} -m snakemake -c1 -q rules " + ' '.join(args)
+        home = Path(f'/tmp/snakeplusplus-test-home-{uid}')
+        home.mkdir(exist_ok=True)
+        os.chown(home, uid, uid)
+        env = {**os.environ, 'USER': f'user{uid}', 'LOGNAME': f'user{uid}', 'HOME': str(home),
+               'XDG_CACHE_HOME': str(home / '.cache')}
+        return subprocess.run(['setpriv', f'--reuid={uid}', f'--regid={uid}', f'--groups={shared_gid}',
+                               'bash', '-c', cmd], cwd=folder, env=env, capture_output=True, text=True)
+
+    def shared_folder():
+        folder = tempfile.mkdtemp(dir='/tmp')
+        os.chown(folder, 0, shared_gid)
+        os.chmod(folder, 0o2775)
+        Path(folder, 'Snakefile').write_text(SHARED_SNAKEFILE)
+        return folder
+
+    # without umask: alice's files block bob
+    folder = shared_folder()
+    try:
+        p = run_as(alice, folder)
+        assert p.returncode == 0, p.stdout + p.stderr
+        p = run_as(bob, folder, '-n')  # all folders are alice's, and not writable for the group
+        assert p.returncode != 0
+        out = p.stdout + p.stderr
+        assert 'The pipeline cannot run here, because you (user54322) cannot write in:' in out
+        assert 'owner 54321' in out and '-user 54321 -exec chmod g+w {} +' in out
+
+        # the top folders writable for the group, but not the files of the jobs
+        for name in ['.snakemake', '.snakemake/snakeplusplus/stamps', 'logs', 'results']:
+            os.chmod(Path(folder, name), 0o2775)
+        p = run_as(bob, folder, '-n')
+        assert 'Warning: Jobs that are up to date (sub-01_hello.log' in p.stdout + p.stderr
+        Path(folder, 'logs/sub-01_hello.log').unlink()  # the job needs to run
+        p = run_as(bob, folder, '-n')
+        assert p.returncode != 0
+        assert 'Jobs that need to run (sub-01_hello.log, everything.log) cannot replace' in p.stdout + p.stderr
+    finally:
+        shutil.rmtree(folder)
+
+    # with umask 002: bob can continue alice's pipeline
+    folder = shared_folder()
+    try:
+        p = run_as(alice, folder, '--config', 'umask=2')
+        assert p.returncode == 0, p.stdout + p.stderr
+        assert oct(os.stat(Path(folder, 'results/sub-01/hello/hello.txt')).st_mode & 0o777) == '0o664'
+        p = run_as(bob, folder, '--config', 'umask=2', 'params=\'{"Hello": {"greeting": "hi"}}\'')
+        assert p.returncode == 0, p.stdout + p.stderr
+        assert 'Warning' not in p.stdout + p.stderr
+        assert Path(folder, 'results/sub-02/hello/hello.txt').read_text() == 'hi'
+    finally:
+        shutil.rmtree(folder)
+
+
+def test_loops_example_runs(tmp_path):
+    # the code fragments on the page "Loops and checkpoints" come from this file
+    shutil.copytree(HERE.parent / 'examples/concepts/data', tmp_path / 'data')
+    p = subprocess.run([sys.executable, '-m', 'snakemake', '-s', str(HERE.parent / 'examples/concepts/loops.smk'),
+                        '-c2', '--directory', str(tmp_path)], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    table = json.loads((tmp_path / 'results/group_table/table.json').read_text())
+    assert [(r['subject'], r['session']) for r in table['rows']] == \
+        [('01', 'a'), ('01', 'b'), ('02', 'a'), ('03', 'a'), ('03', 'b'), ('03', 'c')]
+    assert table['sessions'] == {'01': 2, '02': 1, '03': 3} and table['first'] == 10.0
+    # the loop from the checkpoint finds the same sessions in participants.tsv
+    assert json.loads((tmp_path / 'results/found_table/table.json').read_text()) == table
+    assert '"mean": 10.5' in (tmp_path / 'logs/sub-01_subject_mean.log').read_text()  # sessions a and b
+    assert '"n": 2' in (tmp_path / 'logs/count.log').read_text()
+
+
+def test_logs_example_reruns(tmp_path):
+    # the examples on the pages "Log files", "When jobs rerun" and "Where errors go"
+    shutil.copytree(HERE.parent / 'examples/concepts/texts', tmp_path / 'texts')
+    def run(*args):
+        return subprocess.run([sys.executable, '-m', 'snakemake', '-s', str(HERE.parent / 'examples/concepts/logs.smk'),
+                               '-c2', '--directory', str(tmp_path), *args], capture_output=True, text=True)
+    logs = lambda: sorted(f.name for f in (tmp_path / 'logs').iterdir())
+    p = run()
+    assert p.returncode == 0, p.stdout + p.stderr
+    log = (tmp_path / 'logs/text-fox_count_words.log').read_text()
+    assert log.splitlines()[3] == '{"min_words": 1}'           # the parameters on line 4
+    assert '"words": 9' in log and '"upper": "upper.txt"' in log
+
+    stricter = ('--config', 'params={"CountWords": {"min_words": 2}}')
+    p = run(*stricter)                                          # a parameter change: all three rerun
+    assert jobs_run(p) == ['count_words'] * 3 + ['everything', 'word_report']
+    assert logs() == ['everything.error', 'text-fox_count_words.log', 'text-hamlet_count_words.log',
+                      'text-short_count_words.error', 'word_report.error']
+    assert 'texts/short.txt has 1 words, fewer than min_words=2' in (tmp_path / 'logs/word_report.error').read_text()
+    assert 'Removed outputs of the previous run: upper.txt' in (tmp_path / 'logs/text-fox_count_words.log').read_text()
+
+    (tmp_path / 'texts/short.txt').write_text('hi there\n')    # fixed: only the failed job, and what depends on it
+    p = run(*stricter)
+    assert jobs_run(p) == ['count_words', 'everything', 'word_report']
+    assert 'word_report.log' in logs()
+
+
+def test_howto_example(tmp_path):
+    # the examples on the how-to pages
+    for name in ['Snakefile', 'config.yaml', 'data']:
+        src = HERE.parent / 'examples/howto' / name
+        (shutil.copytree if src.is_dir() else shutil.copy)(src, tmp_path / name)
+    def run(*args):
+        return subprocess.run([sys.executable, '-m', 'snakemake', '-c4', '--directory', str(tmp_path), *args],
+                              capture_output=True, text=True, cwd=tmp_path)
+    def read(name):
+        return (tmp_path / name).read_text()
+    p = run()
+    assert p.returncode == 0, p.stdout + p.stderr
+    # parameters: the config for smooth, the constructor for smooth_wide
+    assert read('logs/sub-01_smooth.log').splitlines()[3] == '{"method": "mean", "width": 3}'
+    assert read('logs/sub-01_smooth_wide.log').splitlines()[3] == '{"method": "mean", "width": 9}'
+    # outputs, and what a receiving job gets
+    overview = json.loads(read('results/sub-01/inspect/overview.json'))
+    assert overview['parts'] == ['part_aa', 'part_ab', 'part_ac'] and len(overview['values']) == 5
+    assert overview['warnings'] is False
+    assert (tmp_path / 'results/sub-01/analyse/plots/histogram.txt').exists()
+    assert (tmp_path / 'results/sub-01/analyse/best_4.5.txt').exists()
+    # commands, with the progress lines left out
+    log = read('logs/sub-01_summarize.log')
+    assert '--parallel=' in log and 'finished' in log and 'progress' not in log.split('Output:')[-1]
+    assert read('results/sub-01/summarize/counts.txt').splitlines()[0] == '2 1'  # value and count: awk swapped the columns
+    # a failed subject is left out of the group
+    assert json.loads(read('results/group_mean/group.json'))['left_out'] == ['03']
+    assert 'Left out, because their analysis failed: 03' in read('logs/group_mean.log')
+    # a parameter change in the config reruns smooth, but not smooth_wide
+    p = run('-n', '--config', 'params={"Smooth": {"width": 4}}')
+    assert 'smooth_wide' not in jobs_run(p) and jobs_run(p).count('smooth') == 3
+    p = run('-n', '--config', 'params={"Smoth": {"width": 4}}')
+    assert 'parameters for Smoth, but no rule of this pipeline has that class; did you mean Smooth?' in p.stderr
+    # fixed data: the group includes all subjects
+    (tmp_path / 'data/sub-03.txt').write_text('7\n8\n9\n')
+    p = run()
+    assert p.returncode == 0 and json.loads(read('results/group_mean/group.json'))['left_out'] == []
+    # a hand-corrected file replaces the computed one, for that subject only
+    (tmp_path / 'manual').mkdir()
+    (tmp_path / 'manual/sub-01-smoothed.txt').write_text('1\n1\n')
+    p = run()
+    assert jobs_run(p) == ['everything', 'model_checked']
+    assert read('results/sub-01/model_checked/model.txt') == '2\n'   # from the manual file: 1 + 1
+    # the cache survives a rerun
+    p = run('-R', 'model')
+    assert 'Reusing cache/sub-01-' in read('logs/sub-01_model.log')
+    assert (tmp_path / 'results/sub-01/model/model.txt').is_symlink()
