@@ -15,11 +15,14 @@ class Measure(SnakeRule):
     """One measurement per subject and session."""
     result_template = 'sub-{subject}/ses-{session}'
 
+    class InputModel:
+        data: Path
+
     class OutputModel:
         value: float
 
     def run(self, job, input, output, params, wildcards):
-        output(value=int(wildcards.subject) * 10 + 'abc'.index(wildcards.session))
+        output(value=float(input.data.read_text()))
 # --8<-- [end:measure]
 
 
@@ -68,22 +71,21 @@ class Count(SnakeRule):
 
 # --8<-- [start:checkpoint]
 class FindSessions(SnakeCheckpoint):
-    """Read the subjects and their sessions from participants.tsv."""
+    """Find the subjects and their sessions in participants.tsv, and the data file of each session."""
     class InputModel:
         participants: Path
 
     class OutputModel:
-        sessions: Path = Field('sessions.json')
+        subjects: list[str]
+        sessions: list[dict[str, str]]
+        data: JobLoop[Path] = Field('{subject}_{session}')   # keys: subject and session
 
     def run(self, job, input, output, params, wildcards):
-        rows = csv.DictReader(open(input.participants), delimiter='\t')
-        found = [dict(subject=r['subject'], session=s) for r in rows for s in r['sessions'].split(',')]
-        json.dump(found, open(output.sessions, 'w'))
-
-
-def found_sessions(wildcards):
-    result = JobResult.from_checkpoint(checkpoints.find_sessions, wildcards)
-    return json.load(open(result.sessions))
+        rows = list(csv.DictReader(open(input.participants), delimiter='\t'))
+        sessions = [dict(subject=r['subject'], session=s) for r in rows for s in r['sessions'].split(',')]
+        output(subjects=[r['subject'] for r in rows], sessions=sessions)
+        for s in sessions:
+            output.data.add(f"data/sub-{s['subject']}/ses-{s['session']}.txt", **s)
 # --8<-- [end:checkpoint]
 
 
@@ -94,7 +96,7 @@ SESSIONS = {'01': ['a', 'b'], '02': ['a'], '03': ['a', 'b', 'c']}
 def sessions_of(wildcards):
     return SESSIONS[wildcards.subject]
 
-measure = Measure()
+measure = Measure().set_input(data='data/sub-{subject}/ses-{session}.txt')
 
 # all combinations: three subjects, each with session a
 first_sessions = measure.foreach(subject=SUBJECTS).foreach(session=['a'])
@@ -115,11 +117,19 @@ count = Count().set_input(values=some_sessions.get_output('value'))
 
 # --8<-- [start:checkpoint_loop]
 find_sessions = FindSessions().set_input(participants='data/participants.tsv')
-found_table = GroupTable().set_input(values=measure.foreach(found_sessions).get_output('value'))
+# the data files that the checkpoint found: {subject} and {session} pick the file for each job
+measure_found = Measure().set_input(data=find_sessions.get_output('data'))
+# a loop over the sessions that the checkpoint found
+found_table = GroupTable().set_input(
+    values=measure_found.foreach(find_sessions.get_output('sessions')).get_output('value'))
+# a loop over one wildcard
+found_means = SubjectMean().set_input(
+    values=measure_found.foreach(session=sessions_of).get_output('value'))
+found_subjects = found_means.foreach(subject=find_sessions.get_output('subjects'))
 # --8<-- [end:checkpoint_loop]
 
 # --8<-- [start:targets]
-everything = target(group_table, subject_mean.foreach(subject=SUBJECTS), count, found_table)
+everything = target(group_table, subject_mean.foreach(subject=SUBJECTS), count, found_table, found_subjects)
 test_run = target(one_job)
 # --8<-- [end:targets]
 

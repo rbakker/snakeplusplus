@@ -15,6 +15,9 @@ other kinds, all in one rule from `examples/howto/Snakefile`:
 | files with a common prefix | `parts: PathPrefix = Field('part_')` | give `output.parts` to a tool as its prefix |
 | one file per key | `values: JobLoop[Path] = Field('value_{index}.txt')` | `output.values(index=i)` for each file |
 | a name known only at run time | `best: Path` (no default) | `output(best=f'best_{best:g}.txt')` |
+| existing files elsewhere, per key | `data: JobLoop[Path] = Field('{subject}')` | `output.data.add(path, subject=s)` |
+
+Several values can be given at once: `output(mean=m, n=len(values))`.
 
 After `run()`, each output is checked: files and folders must exist, values must have been given
 and have the right type. An optional output that was not made is simply left out, and the
@@ -34,6 +37,14 @@ receiving job gets `None`.
 - **An optional file** arrives as `None` when it was not made, so its input must be optional too
   (`Path | None`); this is checked when the Snakefile is loaded.
 - **A value** arrives as the value: `mean: float` in the receiving `InputModel`.
+
+## Existing files, found by a checkpoint
+
+`output.data.add(path, subject='01')` records a file that already exists, e.g. found by a
+checkpoint in another pipeline's results. It is used where it is (its full path is stored), and a
+rerun never removes it. A receiving rule with a wildcard `subject` then gets the file for its own
+subject, checked when the Snakefile is loaded, without an input function; see
+[Checkpoints](../concepts/loops-and-checkpoints.md#checkpoints).
 
 ## Tools that write the files themselves
 

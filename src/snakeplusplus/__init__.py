@@ -801,7 +801,9 @@ class SnakeRule:
         - `rule.foreach(subject=function)`: `function(wildcards)` returns that list;
         - `rule.foreach([dict(subject='01', session='a'), ...])`: explicit combinations;
         - `rule.foreach(function)`: `function(wildcards)` returns such a list of dicts, e.g. read
-          from a file, or from the result of a checkpoint.
+          from a file;
+        - `rule.foreach(subject=find.get_output('subjects'))` or `rule.foreach(find.get_output('sessions'))`:
+          the values, or the dicts, that a checkpoint produced as an output.
 
         Chained calls are nested loops, outer first: `rule.foreach(subject=[...]).foreach(session=[...])`
         gives all combinations. A function gets the wildcards of the receiving job and of the outer
@@ -842,7 +844,8 @@ class SnakeRule:
                 `job.threads` is the number of threads this job got (see `threads_budget`).
             input: The inputs, as an instance of `InputModel`.
             output (JobResult): `output.name` is the full path of output file `name`, in the
-                job's result folder; `output(name=value)` declares an output value.
+                job's result folder; `output(name=value)` declares an output value (several at
+                once: `output(mean=m, n=n)`).
             params: The parameters, as an instance of `ParamModel`.
             wildcards: The wildcards of this job, e.g. `wildcards.subject`.
         """
@@ -969,6 +972,10 @@ class SnakeRule:
             for key, val in job_inputs.items():
                 if isinstance(val, OutputPromise) and not self._condition_holds(val, wildcards, dict(raw_params.items())):
                     job_inputs[key] = None  # connected with when(), and its condition does not hold
+            missing = [f"  {key}: {f}" for key, val in job_inputs.items()
+                       for f in _file_inputs(val, wildcards) if not op.exists(f)]
+            if missing:
+                raise JobError("these input files do not exist:\n" + '\n'.join(missing))
             if previous:
                 self._remove_previous_outputs(job, previous, wildcards, job_inputs)
             failed = self._check_failed_inputs(job, wildcards, job_inputs)
@@ -1087,6 +1094,8 @@ class SnakeRule:
         def full(value, empty_ok=False):
             if isinstance(value, (list, tuple)):
                 value = op.join(*map(str, value))
+            if isinstance(value, str) and op.isabs(value):
+                return None  # an existing file elsewhere (LoopOutput.add()): never removed
             return prefix + value if isinstance(value, str) and (value or empty_ok) else None
         paths = [full(v) for v in mapping.get('by_number', [])]
         for key, value in mapping.get('by_name', {}).items():
@@ -1311,12 +1320,10 @@ class SnakeRule:
 
         paths = []
         for key, val in self.inputs.items():
-            if isinstance(val, str):
-                # simple filename input
-                paths.append(val)
-            elif isinstance(val, (list, tuple)):
-                # multiple filename input
-                paths.append([str(v) for v in val])
+            if isinstance(val, (str, list, tuple)):
+                # file names: only those that exist are given to Snakemake, which would otherwise
+                # stop the whole run; the job itself fails with a clear message (see _run_job)
+                paths.append(lambda wildcards, key=key, val=val: self._existing_files(key, val, wildcards))
             elif isinstance(val, OutputPromise):
                 # input via a SnakeRule or a loop over a SnakeRule; account for checkpoints here.
                 # A connection made with when() is left out for jobs whose parameters do not match.
@@ -1325,12 +1332,28 @@ class SnakeRule:
                     if self._condition_holds(p, wildcards) else []))
             elif _is_input_function(val):
                 # input function that returns paths, or a connection to another rule
-                def paths_of(wildcards, fn=val):
+                def paths_of(wildcards, fn=val, key=key):
                     v = _dynamic(fn, wildcards)
-                    return _promise_stamps(v, wildcards) if isinstance(v, OutputPromise) else v
+                    return _promise_stamps(v, wildcards) if isinstance(v, OutputPromise) else \
+                        self._existing_files(key, v, wildcards)
                 paths.append(snake_checkpoint_magic(paths_of))
 
         return paths
+
+
+    def _existing_files(self, key, val, wildcards):
+        """The file names of an input that exist; a warning in the console for the others, once."""
+        files = _file_inputs(val, wildcards)
+        missing = [f for f in files if not op.exists(f)]
+        builder = _get_builder()
+        if missing and builder.is_main_process:
+            log = self.log_path(self._own_wildcards(wildcards))
+            for f in missing:
+                if (log, f) not in builder.missing_reported:
+                    builder.missing_reported.add((log, f))
+                    print(f"Warning: input '{key}' of job {op.basename(op.splitext(log)[0])} does not exist: {f}; "
+                          f"this job will fail, the others continue", file=sys.stderr)
+        return [f for f in files if f not in missing]
 
 
     def _log_template(self):
@@ -1355,8 +1378,9 @@ class SnakeRule:
 
 
     def _existing_jobs(self, wildcards=None):
-        """Wildcards of this rule's jobs that have a job file, and that agree with `wildcards`.
-        Only files matching this rule's own log file pattern are looked at."""
+        """Wildcards of this rule's jobs that have a job file or a stamp, and that agree with
+        `wildcards`. Only files matching this rule's own log file pattern are looked at. The stamps
+        also find jobs whose log file was deleted, so that they are run again."""
         template = self._log_template()
         names = re.findall(r'\{(\w+)\}', template)
         regex, pos, seen = '', 0, set()
@@ -1374,6 +1398,23 @@ class SnakeRule:
                 if m and all(m[k] == wildcards[k] for k in names if wildcards and k in wildcards):
                     if m.groupdict() not in found:
                         found.append(m.groupdict())
+        # the stamps as they were before this load changed any (see _sync_job_states)
+        snapshot = getattr(_builder, '_stamp_snapshot', None) or {}
+        stamped = snapshot[self.name] if self.name in snapshot else self._stamped_jobs()
+        for wc in stamped:
+            if all(wc[k] == str(wildcards[k]) for k in wc if wildcards and k in wildcards) and wc not in found:
+                found.append(wc)
+        return found
+
+
+    def _stamped_jobs(self):
+        """Wildcards of this rule's jobs that have a stamp file."""
+        own = self._wildcard_names()
+        pattern = op.join(os.getcwd(), STAMP_DIR, self.name, *(['*'] * len(own)), 'job')
+        found = []
+        for f in sorted(glob.glob(pattern)):
+            parts = op.dirname(f).split(op.sep)
+            found.append(dict(zip(own, parts[len(parts) - len(own):])))
         return found
 
 
@@ -1508,6 +1549,8 @@ def _loop_level(rule, args, kwargs):
         (name, values), = kwargs.items()
         if name not in names:
             raise TypeError(f"{cls} has no wildcard '{name}'; it has: {', '.join(names) or 'none'}")
+        if isinstance(values, (SnakeRule, LoopPromise, OutputPromise)):
+            return ('values', name, _checkpoint_values(values, 'values', f"{cls}.foreach({name}=...)"))
         if callable(values):
             return ('values', name, values)
         if isinstance(values, (str, bytes, int, float)):
@@ -1517,6 +1560,8 @@ def _loop_level(rule, args, kwargs):
         _check_values(cls, name, values)
         return ('values', name, values)
     arg, = args
+    if isinstance(arg, (SnakeRule, LoopPromise, OutputPromise)):
+        return ('dicts', _checkpoint_values(arg, 'dicts', f"{cls}.foreach(...)"))
     if callable(arg):
         return ('dicts', arg)
     if isinstance(arg, dict):
@@ -1531,6 +1576,58 @@ def _loop_level(rule, args, kwargs):
         for k, v in d.items():
             _check_values(cls, k, [v])
     return ('dicts', dicts)
+
+
+def _file_inputs(val, wildcards):
+    """The file names of an input given as file names (not a connection), filled in with the
+    wildcards; [] for other inputs."""
+    if isinstance(val, (str, os.PathLike)):
+        val = [val]
+    if not isinstance(val, (list, tuple)):
+        return []
+    files = []
+    for v in val:
+        if isinstance(v, str):
+            files.append(partial_formatter.format(v, **_as_dict(wildcards)))
+        elif isinstance(v, os.PathLike):
+            files.append(os.fspath(v))
+    return files
+
+
+def _checkpoint_values(promise, form, where):
+    """A loop level given by an output of a checkpoint, e.g. `foreach(find.get_output('subjects'))`:
+    checked here, and turned into a function that reads the output once the checkpoint has run.
+    `form` is 'values' (a list of values for one wildcard) or 'dicts' (a list of dicts)."""
+    if not isinstance(promise, OutputPromise) or promise.key is None:
+        raise TypeError(f"{where} needs one output of a checkpoint, e.g. find_subjects.get_output('subjects')")
+    source = promise.rule_or_loop
+    if isinstance(source, LoopPromise) and not source.scalar:
+        raise TypeError(f"{where}: the output of a loop cannot define a loop; use the output of one checkpoint job")
+    rule = promise._rule()
+    if not rule.is_checkpoint:
+        raise TypeError(f"{where}: {type(rule).__name__} is not a checkpoint. A loop can only be defined by "
+                        f"the output of a SnakeCheckpoint, whose result Snakemake reads while it runs")
+    expected = list[typing.Union[str, int, float]] if form == 'values' else list[dict[str, typing.Any]]
+    annotation = rule.OutputModel.model_fields[promise.key].annotation
+    if not is_assignable(annotation, expected):
+        shown = 'a list of values, e.g. list[str]' if form == 'values' else 'a list of dicts, e.g. list[dict[str, str]]'
+        raise TypeError(f"{where}: {type(rule).__name__}.{promise.key} is {_short_type_name(annotation)}, "
+                        f"but a loop needs {shown}")
+    key, fixed = promise.key, dict(source.fixed) if isinstance(source, LoopPromise) else {}
+
+    def checkpoint_output(wildcards):
+        builder = _get_builder()
+        wc = rule._own_wildcards({**dict(wildcards), **fixed})
+        result = JobResult.from_checkpoint(getattr(builder.checkpoints, rule.name), wc)
+        cache_key = (result._log_file, key, op.getmtime(result._log_file))
+        if cache_key not in builder.checkpoint_cache:
+            value = rule._read_output(result, key, wc)
+            if value is None:
+                raise JobError(f"checkpoint {rule.name} did not produce its output {key!r}")
+            builder.checkpoint_cache[cache_key] = value
+        return builder.checkpoint_cache[cache_key]
+    checkpoint_output.__name__ = f'{rule.name}.{key}'
+    return checkpoint_output
 
 
 def _fixed_wildcards(rule, wildcards):
@@ -1832,7 +1929,11 @@ _reported_loop_errors = set()  # print each deferred loop error only once
 class SnakeCheckpoint(SnakeRule):
     """A rule whose result determines which jobs come next, e.g. the list of subjects to process.
 
-    A loop reads it in its iterator function with `JobResult.from_checkpoint()`:
+    Its outputs can define loops directly: `rule.foreach(subject=find.get_output('subjects'))` for
+    a `list[str]` output, `rule.foreach(find.get_output('sessions'))` for a `list[dict]` output.
+    Files it found elsewhere are recorded with `output.data.add(path, subject=s)` and connected
+    with `find.get_output('data')`. For anything else, a loop function can read the result itself
+    with `JobResult.from_checkpoint()`:
 
     Example:
         ```python
@@ -1910,6 +2011,10 @@ class PipelineBuilder:
         self.linemaps = None      # Snakemake line maps, for correct line numbers in error messages
         self.is_main_process = True  # False when Snakemake re-parses the Snakefile to run a job
         self.execution_started = False  # True once Snakemake starts running jobs (not in a dry run)
+        self.syncing = False      # True while _sync_job_states() works out which jobs are outdated
+        self.checkpoints = None   # Snakemake's `checkpoints`, for loops over a checkpoint's output
+        self.checkpoint_cache = {}  # (log file, output, modification time) -> value of a checkpoint output
+        self.missing_reported = set()  # (log file, input file) that were reported as missing
 
 
     # Collect all rules in the scope of namespace.
@@ -1979,6 +2084,9 @@ class PipelineBuilder:
         if op.isdir(locks) and os.listdir(locks):
             return  # another Snakemake process is active: leave everything as it is
 
+        # the stamps as they are now: visiting a job may remove its stamp, and a loop over a
+        # checkpoint that cannot be expanded finds its jobs by their log files and stamps
+        self._stamp_snapshot = {rule.name: rule._stamped_jobs() for rule in self.rules.values()}
         outdated = {}  # log path -> bool, for every job visited
         blocked = {}   # log path -> folders that stop that job from running
         blocked_maybe = {}  # the same, for jobs that are up to date
@@ -2051,9 +2159,13 @@ class PipelineBuilder:
                 os.utime(stamp, (t, t))
             return is_outdated
 
-        for rule in self.rules.values():
-            if not rule._wildcard_names():
-                visit(rule, {})
+        self.syncing = True  # lets JobResult.from_checkpoint() read a finished checkpoint now
+        try:
+            for rule in self.rules.values():
+                if not rule._wildcard_names():
+                    visit(rule, {})
+        finally:
+            self.syncing = False
 
         def jobs(logs):
             return ', '.join(op.basename(log) for log in list(logs)[:5]) + (
@@ -2173,6 +2285,7 @@ class PipelineBuilder:
 
         workflow = namespace.get('workflow')
         self.linemaps = getattr(workflow, 'linemaps', None)
+        self.checkpoints = namespace.get('checkpoints')
         # the cores Snakemake was given (-c); without -c (e.g. a dry run), all cores of this machine
         try:
             self.cores = workflow.cores
@@ -2190,7 +2303,6 @@ class PipelineBuilder:
 
         if self.is_main_process and not _read_only:
             self._check_writable_folders()
-        self._sync_job_states()
 
         # the default target (for `snakemake` without target name): like in Snakemake, the first
         # target in the Snakefile; without target(), the first rule without wildcards
@@ -2217,6 +2329,10 @@ class PipelineBuilder:
             if verbose:
                 print('Injecting rule\n',json.dumps(vars(r),indent=2,default=str))
             inject_rule(r)
+
+        # after the rules exist in Snakemake, so that loop functions can read a checkpoint that
+        # has run (`checkpoints.<name>` only exists from here on)
+        self._sync_job_states()
 
 
 def _apply_umask_to_snakemake_folder(umask):

@@ -15,6 +15,13 @@ wildcards of the receiving rule. Both are checked when the Snakefile is loaded; 
 `get_output('x').when(use_alt=True)` makes the connection only for jobs with that parameter
 value; see [Connections that depend on a parameter](../concepts/connecting.md#connections-that-depend-on-a-parameter).
 
+## Files that a checkpoint found
+
+When the files come from a checkpoint, e.g. the results of another pipeline, the checkpoint can
+record them as an output with keys, with `output.data.add(path, subject=s)`; a receiving rule
+with the wildcard `subject` gets its own file. See
+[Checkpoints](../concepts/loops-and-checkpoints.md#checkpoints).
+
 ## Anything else: an input function
 
 An input can be a function of the wildcards that returns a file name, or a connection to another

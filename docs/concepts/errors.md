@@ -45,7 +45,20 @@ Everything that goes wrong inside a job ends up in its `.error` file, under `Err
     ```
 
 - **inputs of the wrong type**, which could only be checked when the job got them, e.g. the
-  result of an input function.
+  result of an input function;
+- **input files that do not exist**, e.g. a scan that is missing for one subject:
+
+    ```
+    these input files do not exist:
+      text: texts/hamlet.txt
+    ```
+
+    Snakemake itself would refuse to start the whole run for a missing input file. Snakeplusplus
+    lets the other jobs run, and warns in the console before the run starts:
+
+    ```
+    Warning: input 'text' of job text-hamlet_count_words does not exist: texts/hamlet.txt; this job will fail, the others continue
+    ```
 
 For Snakemake, the job succeeded, so it carries on with all jobs that do not depend on it.
 

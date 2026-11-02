@@ -11,7 +11,7 @@ inputs of each job, not from the dates of result files, nor from code. A job run
 | its parameters changed | Snakemake keeps the parameters of each job's last run, and compares them; line 4 of the log shows them |
 | a job it depends on runs | its inputs may change |
 | an input file changed | for inputs given as a file name, like `'texts/{name}.txt'`: Snakemake notices a changed file (a newer date and different content) |
-| its set of inputs changed | e.g. a loop got another member, or an input function returns another file |
+| its set of inputs changed | e.g. a loop got another member, an input function returns another file, or a missing input file appeared |
 
 And it does **not** run again when:
 

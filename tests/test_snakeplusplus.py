@@ -1859,6 +1859,11 @@ def test_loops_example_runs(tmp_path):
     assert json.loads((tmp_path / 'results/found_table/table.json').read_text()) == table
     assert '"mean": 10.5' in (tmp_path / 'logs/sub-01_subject_mean.log').read_text()  # sessions a and b
     assert '"n": 2' in (tmp_path / 'logs/count.log').read_text()
+    # the subjects that the checkpoint found, each with the mean of its sessions
+    assert '"mean": 31.0' in (tmp_path / 'logs/sub-03_found_means.log').read_text()
+    # files the checkpoint found are used where they are, and listed with their keys
+    log = (tmp_path / 'logs/find_sessions.log').read_text()
+    assert str(tmp_path / 'data/sub-03/ses-c.txt') in log and '"session": "c"' in log
 
 
 def test_logs_example_reruns(tmp_path):
@@ -1935,3 +1940,73 @@ def test_howto_example(tmp_path):
     p = run('-R', 'model')
     assert 'Reusing cache/sub-01-' in read('logs/sub-01_model.log')
     assert (tmp_path / 'results/sub-01/model/model.txt').is_symlink()
+
+
+def test_deleted_log_in_a_loop_over_a_checkpoint_reruns(tmp_path):
+    # a job that a loop over a checkpoint reaches: deleting its log reruns it, and what depends on it
+    shutil.copytree(HERE.parent / 'examples/concepts/data', tmp_path / 'data')
+    snakefile = (HERE.parent / 'examples/concepts/loops.smk').read_text()
+    def run(snakefile, *args):
+        (tmp_path / 'Snakefile').write_text(snakefile)
+        return subprocess.run([sys.executable, '-m', 'snakemake', '-c2', '--directory', str(tmp_path), *args],
+                              capture_output=True, text=True, cwd=tmp_path)
+    assert run(snakefile).returncode == 0
+    (tmp_path / 'logs/sub-03_ses-c_measure_found.log').unlink()
+    p = run(snakefile, '-n')
+    assert {'measure_found', 'found_table', 'found_means'} <= set(jobs_run(p)), p.stdout + p.stderr
+    # only reached through the checkpoint
+    keep = [line for line in snakefile.splitlines()
+            if not line.startswith(('subject_mean = ', 'group_table = ', 'count = ', 'everything = ', 'test_run = '))]
+    only_checkpoint = '\n'.join(keep).replace('snakeplusplus.build(locals())',
+                                               'everything = target(found_table)\nsnakeplusplus.build(locals())')
+    assert run(only_checkpoint).returncode == 0
+    (tmp_path / 'logs/sub-03_ses-c_measure_found.log').unlink()
+    p = run(only_checkpoint)
+    assert jobs_run(p) == ['everything', 'found_table', 'measure_found'], p.stdout + p.stderr
+    assert (tmp_path / 'logs/sub-03_ses-c_measure_found.log').exists()
+
+
+def test_missing_input_file_fails_only_its_job(tmp_path):
+    shutil.copytree(HERE.parent / 'examples/concepts/texts', tmp_path / 'texts')
+    (tmp_path / 'texts/hamlet.txt').unlink()
+    def run(*args):
+        return subprocess.run([sys.executable, '-m', 'snakemake', '-s', str(HERE.parent / 'examples/concepts/logs.smk'),
+                               '-c2', '--directory', str(tmp_path), *args], capture_output=True, text=True)
+    p = run()
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "input 'text' of job text-hamlet_count_words does not exist: texts/hamlet.txt" in p.stderr
+    assert sorted(f.name for f in (tmp_path / 'logs').iterdir()) == [
+        'everything.error', 'text-fox_count_words.log', 'text-hamlet_count_words.error',
+        'text-short_count_words.log', 'word_report.error']
+    assert 'these input files do not exist:\n  text: texts/hamlet.txt' in \
+        (tmp_path / 'logs/text-hamlet_count_words.error').read_text()
+    shutil.copy(HERE.parent / 'examples/concepts/texts/hamlet.txt', tmp_path / 'texts')   # now it runs
+    p = run()
+    assert jobs_run(p) == ['count_words', 'everything', 'word_report']
+
+
+def test_loop_over_a_checkpoint_output_is_checked_when_loaded():
+    from snakeplusplus import SnakeRule, SnakeCheckpoint, Field
+
+    class Find(SnakeCheckpoint):
+        class OutputModel:
+            subjects: list[str]
+            pairs: list[dict[str, str]]
+            count: int
+
+    class Job(SnakeRule):
+        result_template = 'sub-{subject}'
+
+    class NotACheckpoint(SnakeRule):
+        class OutputModel:
+            subjects: list[str]
+
+    find = Find()
+    Job().foreach(subject=find.get_output('subjects'))
+    Job().foreach(find.get_output('pairs'))
+    with pytest.raises(TypeError, match=r"Find.pairs is list\[dict\[str, str\]\], but a loop needs a list of values"):
+        Job().foreach(subject=find.get_output('pairs'))
+    with pytest.raises(TypeError, match=r"Find.count is int, but a loop needs a list of dicts"):
+        Job().foreach(find.get_output('count'))
+    with pytest.raises(TypeError, match="NotACheckpoint is not a checkpoint"):
+        Job().foreach(subject=NotACheckpoint().get_output('subjects'))

@@ -283,7 +283,8 @@ class LoopOutput:
     `tracts: JobLoop[Path] = Field('tract_{param}.tck')`, where `{param}` is a key within the job.
     In run(), `output.tracts(param=2)` gives the full path of one file, and records it. A tool that
     writes the files itself can get `output.tracts.prefix` or `output.tracts.pattern`; files that
-    run() does not record are then found after the job by their names.
+    run() does not record are then found after the job by their names. `output.tracts.add(path,
+    param=2)` records an existing file elsewhere, e.g. one that a checkpoint found.
     """
     def __init__(self, result, name, pattern, keys):
         self._result = result
@@ -292,7 +293,18 @@ class LoopOutput:
         self._keys = list(keys)
         self._files = []         # recorded in run(): (keys, file name relative to the result prefix)
 
-    def __call__(self, **keys):
+    def add(self, path, **keys):
+        """Record an existing file, e.g. found by a checkpoint, as the file for these keys: it is
+        used where it is, and never removed by a rerun. Returns its full path."""
+        keys = self._check_keys(keys)
+        path = op.abspath(str(path))
+        if not op.exists(path):
+            raise FileNotFoundError(f"output '{self._name}': {path} does not exist")
+        if (keys, path) not in self._files:
+            self._files.append((keys, path))
+        return Path(path)
+
+    def _check_keys(self, keys):
         if set(keys) != set(self._keys):
             raise TypeError(f"output '{self._name}' needs the key(s) {', '.join(self._keys)}, "
                             f"got {', '.join(keys) or 'none'}")
@@ -300,6 +312,10 @@ class LoopOutput:
         for k, v in keys.items():
             if not v or '/' in v:
                 raise ValueError(f"output '{self._name}': key {k}={v!r} is not allowed (empty, or contains '/')")
+        return keys
+
+    def __call__(self, **keys):
+        keys = self._check_keys(keys)
         name = self._pattern.format(**keys)
         if (keys, name) not in self._files:
             self._files.append((keys, name))
@@ -371,10 +387,17 @@ class JobResult():
         `checkpoints.<name>` in the Snakefile. Snakemake runs the checkpoint first if needed."""
         # trigger checkpoint execution; raises snakemake's IncompleteCheckpointException
         # while the checkpoint has not run yet, which Snakemake handles itself.
-        checkpoint_job.get(**wildcards)
         from . import _get_builder, _as_dict
-        rule = _get_builder().rules[checkpoint_job.rule.name]
+        builder = _get_builder()
+        rule = builder.rules[checkpoint_job.rule.name]
         log_file = rule.log_path(rule._own_wildcards(_as_dict(wildcards)))
+        try:
+            checkpoint_job.get(**wildcards)
+        except Exception:
+            # While the Snakefile is loaded, Snakemake has not looked at any checkpoint yet. To
+            # find out which jobs are outdated, a checkpoint that finished is read from its log.
+            if not (builder.syncing and op.exists(log_file)):
+                raise
         error = read_errors(log_file)
         if error:
             raise UpstreamFailedError(f'Checkpoint `{op.splitext(log_file)[0]}` failed due to:\n{error}')
@@ -459,6 +482,11 @@ class JobResult():
 
 
     def __call__(self, *args, **kwargs):
+        if len(kwargs) > 1 and not args:
+            # several outputs at once, e.g. output(subjects=[...], sessions=[...])
+            for name, value in kwargs.items():
+                self(**{name: value})
+            return None
         if len(args) + len(kwargs) > 1:
             raise TypeError(
                 f"JobResult.call takes only one positional or keyword argument, got {len(args)} + {len(kwargs)}."
@@ -531,6 +559,9 @@ class JobResult():
 
 
     def _file(self, *args):
+        if args and op.isabs(str(args[0])):
+            # an existing file elsewhere, e.g. recorded with LoopOutput.add()
+            return op.join(str(args[0]), *map(str, args[1:]))
         if args:
             # Note: str(args[0]) handles if the first arg is already a path string
             result_file = op.join(self._prefix + str(args[0]), *map(str, args[1:]))

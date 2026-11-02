@@ -26,8 +26,9 @@ Before that:
 
 - the pipeline cannot check that those jobs have different log files and result folders, which
   it does for all other jobs;
-- to decide what is up to date, snakeplusplus finds the existing jobs of such a loop by the names
-  of their log files.
+- to decide what is up to date, snakeplusplus finds the existing jobs of such a loop by their log
+  files and stamp files. Once the checkpoint has run, its result is read when the Snakefile is
+  loaded, and the loop is known exactly.
 
 ## In the log files
 

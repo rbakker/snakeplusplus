@@ -14,7 +14,7 @@ The examples on this page come from a small study with subjects and sessions, in
 
 ## Making a loop
 
-`foreach()` adds one loop level per call, in one of four forms:
+`foreach()` adds one loop level per call, in one of these forms:
 
 ```python
 --8<-- "examples/concepts/loops.smk:loops"
@@ -26,6 +26,7 @@ The examples on this page come from a small study with subjects and sessions, in
 | `foreach(session=function)` | the values that `function(wildcards)` returns |
 | `foreach([dict(subject='01', session='b'), ...])` | these combinations of wildcards |
 | `foreach(function)` | the dicts that `function(wildcards)` returns |
+| `foreach(subject=find.get_output('subjects'))`, `foreach(find.get_output('sessions'))` | the values, or the dicts, that a checkpoint produced; see [Checkpoints](#checkpoints) |
 
 Chained calls are nested loops, outer first: `foreach(subject=SUBJECTS).foreach(session=['a'])`
 gives every combination. A function in an inner level gets the wildcards of the outer levels, so
@@ -99,23 +100,55 @@ A `JobLoop` can also be made from files that another pipeline produced, with
 
 Sometimes the loop's contents are only known once the pipeline has run part of its work: the
 subjects that passed quality control, or the sessions listed in a file. A `SnakeCheckpoint` is a
-rule like any other, except that a loop function can read its result with
-`JobResult.from_checkpoint()`:
+rule like any other, whose outputs can define loops:
 
 ```python
 --8<-- "examples/concepts/loops.smk:checkpoint"
 ```
 
-`checkpoints.find_sessions` is Snakemake's name for the checkpoint `find_sessions` in the
-Snakefile. The loop function returns the combinations of wildcards, so it is used in the
-`foreach(function)` form:
+It has three outputs: the subjects and the sessions as values, stored in its log file, and the data
+file of each session. `output.data.add(path, subject=..., session=...)` records a file that exists
+elsewhere, under these keys; it is used where it is, and never removed by a rerun. The checkpoint
+is then connected like other rules:
 
 ```python
 --8<-- "examples/concepts/loops.smk:checkpoint_loop"
 ```
 
-Snakemake first runs `find_sessions`, then calls `found_sessions` to find out which `measure`
-jobs `found_table` needs, runs those, and then `found_table`.
+- **`foreach(find_sessions.get_output('sessions'))`**: a loop over the combinations of wildcards
+  in a list of dicts.
+- **`foreach(subject=find_sessions.get_output('subjects'))`**: a loop over the values of one
+  wildcard, in a list.
+- **`find_sessions.get_output('data')`**: the data files, whose keys `subject` and `session` are
+  filled in by the wildcards of each `measure_found` job, as for any output with several files
+  (see [Keys work like wildcards](connecting.md#keys-work-like-wildcards)). Each job gets its own
+  file, as a `Path`.
+
+These connections are checked when the Snakefile is loaded, like all others: the output must be a
+list of values or of dicts, and it must come from a checkpoint, since Snakemake only reads the
+results of checkpoints while it runs:
+
+```
+TypeError: SubjectMean.foreach(subject=...): FindSessions.sessions is list[dict[str, str]], but a loop
+needs a list of values, e.g. list[str]
+```
+
+Snakemake first runs `find_sessions`, then works out which `measure_found` jobs the loops need,
+runs those, and then `found_table` and `found_means`. A checkpoint's outputs are read once per run.
+
+### Checkpoint results in your own functions
+
+For anything else, e.g. a loop that combines a checkpoint's result with other information, a loop
+function can read the result itself with `JobResult.from_checkpoint()`:
+
+```python
+def subjects_that_passed(wildcards):
+    result = JobResult.from_checkpoint(checkpoints.quality_control, wildcards)
+    return [s for s in result.subjects if s not in EXCLUDED]
+```
+
+`checkpoints.quality_control` is Snakemake's name for the checkpoint `quality_control` in the
+Snakefile. Such a function is only checked when it runs, and the diagram shows its name.
 
 ## When a loop function fails
 
