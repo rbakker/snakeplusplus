@@ -1723,6 +1723,16 @@ def test_conditional_input(tmp_path):
     assert jobs_run(p).count('expensive') == 1                   # only for subject 02, not again for 01
 
 
+def test_unused_conditional_input_does_not_make_a_job_outdated(tmp_path):
+    # fit does not use expensive (use_alt is False), so a failed expensive job must not rerun it
+    p = run_targets(tmp_path, CONDITIONAL_INPUT_SNAKEFILE)
+    assert p.returncode == 0, p.stdout + p.stderr
+    (tmp_path / 'logs/sub-01_expensive.error').write_text('failed in an earlier run\n')
+    p = run_targets(tmp_path, CONDITIONAL_INPUT_SNAKEFILE, '-n')
+    assert 'Nothing to be done' in p.stdout + p.stderr, p.stdout + p.stderr
+    assert (tmp_path / '.snakemake/snakeplusplus/stamps/fit/01/job').exists()   # the dry run kept its stamp
+
+
 def test_conditional_input_is_checked_when_loaded():
     from snakeplusplus import SnakeRule, Field
 

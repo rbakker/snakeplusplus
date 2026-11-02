@@ -2198,6 +2198,13 @@ class PipelineBuilder:
                     continue  # e.g. depends on a checkpoint that has not run yet
             if not isinstance(val, OutputPromise):
                 continue
+            try:
+                # parameters given as a function expect wildcards with attribute access
+                used = rule._condition_holds(val, _Wildcards(wildcards))
+            except Exception:
+                used = True  # cannot tell yet: count the connection, to be on the safe side
+            if not used:
+                continue  # connected with when(), and not used by this job
             source = val.rule_or_loop
             if isinstance(source, LoopPromise):
                 try:
