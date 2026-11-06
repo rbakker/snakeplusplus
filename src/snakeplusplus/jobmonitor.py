@@ -180,6 +180,28 @@ def permission_advice(paths, intro):
     return '\n'.join(advice)
 
 
+def _check_extra_env(extra_env):
+    """`extra_env` of job.run() and job.shell(), checked: names as strings, values as strings or None."""
+    if not extra_env:
+        return {}
+    if not isinstance(extra_env, dict):
+        raise TypeError(f"extra_env must be a dict of variable names and values, got {type(extra_env).__name__}")
+    checked = {}
+    for k, v in extra_env.items():
+        if not isinstance(k, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', k):
+            raise ValueError(f"extra_env: {k!r} is not a valid name for an environment variable")
+        checked[k] = None if v is None else str(v)
+    return checked
+
+
+def _extra_env_text(extra):
+    """How extra environment variables are shown in the log: ' (with A=1, B unset)'."""
+    if not extra:
+        return ''
+    return ' (with ' + ', '.join(f'{k} unset' if v is None else f'{k}={shlex.quote(v)}'
+                                 for k, v in extra.items()) + ')'
+
+
 def format_command(cmd):
     """A command as readable text: the program, then one argument per line, with an option and
     the one value that follows it on the same line. Arguments are quoted only where needed."""
@@ -810,7 +832,7 @@ class JobMonitor():
         return '\n'.join(output)
       
 
-    def run(self, cmd, cwd=None, timeout=None, env=None,
+    def run(self, cmd, cwd=None, timeout=None, env=None, extra_env=None,
             fail_on_error=True, update_interval=None, formatter=None):
         """Run a command, with its output in the log file.
 
@@ -819,7 +841,11 @@ class JobMonitor():
                 is passed as it is, so no quoting is needed.
             cwd: Folder to run the command in.
             timeout: Maximum run time in seconds.
-            env: Environment variables for the command (default: those of the job).
+            env: The environment of the command, replacing that of the job, as in `subprocess`
+                (default: the job's environment).
+            extra_env: Variables added to the environment, e.g. `{'OMP_NUM_THREADS': job.threads}`;
+                values are converted to strings, and None removes a variable. They are written
+                to the log with the command.
             fail_on_error: If True, a nonzero exit code fails the job. If False, it is reported
                 as an error in the log, and `run()` continues.
             update_interval: For long commands: write their output to the log every this many
@@ -832,7 +858,15 @@ class JobMonitor():
         """
 
         print(f'Running process `{subprocess.list2cmdline(cmd)}`,\n=> output to {self.log_file}.')
-        self.log(f'Running command:\n\n```\n{format_command(cmd)}\n```\n')
+        extra = _check_extra_env(extra_env)
+        if extra:
+            env = dict(os.environ if env is None else env)
+            for k, v in extra.items():
+                if v is None:
+                    env.pop(k, None)
+                else:
+                    env[k] = v
+        self.log(f'Running command{_extra_env_text(extra)}:\n\n```\n{format_command(cmd)}\n```\n')
 
         # the command's output goes into a Markdown code block, closed even if the command
         # raises (e.g. a timeout), so that whatever follows is not swallowed by the block
@@ -905,11 +939,12 @@ class JobMonitor():
             self.log('```\n', time_it=False)
 
 
-    def shell(self,script):
+    def shell(self, script, extra_env=None):
         """Run a shell script, e.g. a command with pipes or redirection, with its output in the log
         file. If the script exits with a nonzero code (that of its last command), the job fails.
         The script is run as it is: braces are not filled in, so `awk '{print $1}'` works as in a
-        terminal; use an f-string to put in file names.
+        terminal; use an f-string to put in file names. `extra_env` adds environment variables, as
+        in `run()`.
 
         Example:
             ```python
@@ -917,12 +952,15 @@ class JobMonitor():
             ```
         """
         from snakemake import shell as sh
-        self.log(f'Running shell script:\n\n```\n{escape_fences(script.strip())}\n```\n')
+        extra = _check_extra_env(extra_env)
+        self.log(f'Running shell script{_extra_env_text(extra)}:\n\n```\n{escape_fences(script.strip())}\n```\n')
+        exports = ''.join(f'unset {k}; ' if v is None else f'export {k}={shlex.quote(v)}; '
+                          for k, v in extra.items())
         start = self._open_output_block()
         try:
             # the script is used as it is (usually an f-string): braces are escaped, so that
             # Snakemake's shell() does not fill them in a second time, e.g. in awk '{print $1}'
-            command = f'set +euo pipefail; exec >> {shlex.quote(self.running_log)} 2>&1; ' + script
+            command = f'set +euo pipefail; exec >> {shlex.quote(self.running_log)} 2>&1; ' + exports + script
             sh(command.replace('{', '{{').replace('}', '}}'), **self.shell_context)
         finally:
             self._close_output_block(start)

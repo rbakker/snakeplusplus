@@ -51,6 +51,29 @@ With `fail_on_error=False`, the error is recorded but `run()` continues, e.g. to
 checks of a quality-control step; the job still ends as `.error`. For a tool whose nonzero exit
 code is not an error, like `grep` that found nothing, use `job.shell("grep ... || true")`.
 
+## Environment variables
+
+`extra_env` adds variables to the environment of a command, e.g. for the number of threads of a
+tool that reads it from the environment:
+
+```python
+job.run(['antsRegistration', ...], extra_env={'ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS': job.threads})
+job.shell(f"mrcalc ... | mrconvert - {output.fa}", extra_env={'MRTRIX_NTHREADS': job.threads})
+```
+
+Values are converted to strings, and `None` removes a variable, e.g. `extra_env={'PYTHONPATH':
+None}` to keep a tool from picking up the pipeline's Python packages. The variables are written to
+the log with the command:
+
+```
+[0:00:00] Running command (with ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=4):
+```
+
+`env` replaces the whole environment instead, as in Python's `subprocess`: the command then gets
+only these variables, without `PATH`. That is only useful for a deliberately clean environment.
+Variables that should not appear in the logs, such as licence keys, are best set before
+starting Snakemake: every job inherits them.
+
 ## Long commands
 
 By default the output is written to the log when the command ends. With `update_interval=60`,

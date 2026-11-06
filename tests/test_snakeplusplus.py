@@ -2020,3 +2020,46 @@ def test_loop_over_a_checkpoint_output_is_checked_when_loaded():
         Job().foreach(find.get_output('count'))
     with pytest.raises(TypeError, match="NotACheckpoint is not a checkpoint"):
         Job().foreach(subject=NotACheckpoint().get_output('subjects'))
+
+
+EXTRA_ENV_SNAKEFILE = """
+import os
+from pathlib import Path
+import snakeplusplus
+from snakeplusplus import SnakeRule, target, Field
+snakeplusplus.configure(dict(logs='logs', results='results'))
+os.environ['SPP_REMOVE_ME'] = 'still here'
+
+class Env(SnakeRule):
+    class OutputModel:
+        seen: Path = Field('seen.txt')
+        shell_seen: Path = Field('shell_seen.txt')
+    def run(self, job, input, output, params, wildcards):
+        code, out = job.run(['sh', '-c', 'echo "$SPP_THREADS|$SPP_LABEL|${SPP_REMOVE_ME-unset}|${PATH:+path}"'],
+                            extra_env={'SPP_THREADS': 4, 'SPP_LABEL': 'a b', 'SPP_REMOVE_ME': None})
+        output.seen.write_text(out)
+        job.shell(f'echo "$SPP_THREADS|${{SPP_REMOVE_ME-unset}}" > {output.shell_seen}',
+                  extra_env={'SPP_THREADS': 2, 'SPP_REMOVE_ME': None})
+
+env_rule = Env()
+everything = target(env_rule)
+"""
+
+
+def test_extra_env(tmp_path):
+    p = run_targets(tmp_path, EXTRA_ENV_SNAKEFILE)
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert (tmp_path / 'results/env_rule/seen.txt').read_text() == '4|a b|unset|path\n'   # PATH kept
+    assert (tmp_path / 'results/env_rule/shell_seen.txt').read_text() == '2|unset\n'
+    log = (tmp_path / 'logs/env_rule.log').read_text()
+    assert "Running command (with SPP_THREADS=4, SPP_LABEL='a b', SPP_REMOVE_ME unset):" in log
+    assert 'Running shell script (with SPP_THREADS=2, SPP_REMOVE_ME unset):' in log
+
+
+def test_extra_env_names_are_checked():
+    from snakeplusplus.jobmonitor import _check_extra_env
+    assert _check_extra_env({'A': 1, 'B': None}) == {'A': '1', 'B': None}
+    with pytest.raises(ValueError, match="'MY-VAR' is not a valid name"):
+        _check_extra_env({'MY-VAR': 1})
+    with pytest.raises(TypeError, match='extra_env must be a dict'):
+        _check_extra_env([('A', 1)])
