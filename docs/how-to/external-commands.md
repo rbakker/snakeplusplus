@@ -36,6 +36,21 @@ names with spaces need quotes in the script.
 The script is run as it is, so braces need no special care, except that an f-string turns `{{`
 into `{`: `awk '{{print $2, $1}}'` in an f-string is `awk '{print $2, $1}'` in the shell.
 
+## Your own messages in the log
+
+`job.log()` writes a line to the log, with the time since the job started, e.g. what `run()`
+decided or found:
+
+```python
+job.log(f'{len(streamlines)} streamlines left after filtering')
+```
+
+```
+[0:12:31] 48112 streamlines left after filtering
+```
+
+`print()` goes to Snakemake's console output instead, among that of all other jobs.
+
 ## When a command fails
 
 A nonzero exit code stops the job: the log file becomes `.error`, with the command's output

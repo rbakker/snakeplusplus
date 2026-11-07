@@ -21,6 +21,12 @@ And it does **not** run again when:
 - **a file changed that the job reads but does not have as an input**, e.g. a lookup table that
   `run()` opens from a fixed location. Delete the log file of the job that reads it.
 
+!!! warning "After changing a rule's code"
+
+    Nothing warns that a rule's code changed since its jobs ran. If the change affects the
+    results, rerun the rule's jobs: `snakemake -R five_tt`, and Snakemake reruns the jobs that
+    depend on them as well. A dry run, `snakemake -n -R five_tt`, shows what that involves.
+
 ## An example
 
 In `examples/concepts/logs.smk`, three texts are counted. Raising the minimum number of words

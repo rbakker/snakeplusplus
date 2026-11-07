@@ -156,6 +156,65 @@ Snakemake's own namespace, some names cannot be used:
   `onerror`, `wildcard_constraints` and `scattergather`. Snakemake reports these as a syntax
   error. Rules in an imported module can use them as field names.
 
+## Rule classes in a module
+
+For a pipeline with more than a few rules, put the rule classes in a Python module, and keep only
+the connections in the Snakefile:
+
+```
+workflow/
+    Snakefile
+    rules/
+        texts.py
+```
+
+```python title="workflow/rules/texts.py"
+from pathlib import Path
+from snakeplusplus import SnakeRule, Field
+
+
+class CountWords(SnakeRule):
+    """Count the words of one text."""
+    result_template = 'text-{name}'
+
+    class InputModel:
+        text: Path
+
+    class OutputModel:
+        report: Path = Field('report.txt')
+
+    def run(self, job, input, output, params, wildcards):
+        use = len(input.text.read_text().split())
+        job.log(f'{input.text} has {use} words')
+        output.report.write_text(f'{use}\n')
+```
+
+```python title="workflow/Snakefile"
+import snakeplusplus
+from snakeplusplus import target
+from rules.texts import CountWords
+
+snakeplusplus.configure(dict(logs='logs', results='results'))
+
+count_words = CountWords().set_input(text='texts/{name}.txt')
+everything = target(count_words.foreach(name=['fox']))
+
+snakeplusplus.build(locals())
+```
+
+This has several advantages:
+
+- **Snakemake's keywords are ordinary names in a module.** Snakemake's parser reads the
+  Snakefile, not the modules it imports, so `report` as an output and `use` as a variable work
+  above. In a Snakefile, they would be a syntax error that snakeplusplus cannot catch.
+- **The Snakefile shows the pipeline at a glance**: which rules, how they are connected, and the
+  targets.
+- **Rule classes can be shared** between pipelines, and tested on their own.
+
+Snakemake puts the Snakefile's folder on Python's path, so `from rules.texts import ...` works
+without further setup. The checks when the Snakefile is loaded, such as names in `run()` that are
+not defined, also cover rule classes in modules.
+
 ## Other settings
 
 | Attribute | Meaning |

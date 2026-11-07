@@ -3,6 +3,18 @@
 Usually all jobs of a rule get their inputs from the same place. When the source depends on the
 job, there are several ways, from the most to the least checked.
 
+## An input that is not always given
+
+An optional input (`mask: Path | None` in the `InputModel`) can be connected to `None`, so a
+value from the config can be passed as it is:
+
+```python
+fit = Fit().set_input(dwi=denoise.get_output('denoised'), mask=config.get('mask'))
+```
+
+When the config has no `mask`, the jobs get `None`. For an input that is not optional, `None` is
+an error when the Snakefile is loaded.
+
 ## An output that depends on a wildcard
 
 When a rule has outputs per hemisphere, `DRT_L` and `DRT_R`, a pattern picks the one for each

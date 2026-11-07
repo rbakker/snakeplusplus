@@ -16,8 +16,15 @@ with Snakemake:
   defined in the Snakefile. Snakemake reads them as its own syntax before Python sees them, so
   snakeplusplus cannot catch them, and the message is Snakemake's: for a variable `report`,
   `SyntaxError: Colon expected after keyword report`; for an output field `report`, an error
-  from Snakemake's own `report()`, or another unrelated message. Rule classes defined in an imported
-  Python module are not affected.
+  from Snakemake's own `report()`, or another unrelated message. This also holds inside functions,
+  e.g. a variable `use` in `run()`. Rule classes defined in an imported Python module are not
+  affected: see [Rule classes in a module](concepts/rules.md#rule-classes-in-a-module).
+
+## Code changes
+
+A change in a rule's code does not rerun its jobs, and nothing warns about it: jobs that succeeded
+keep their results (see [When jobs rerun](concepts/reruns.md)). After a change that affects the
+results, rerun the rule's jobs yourself with `snakemake -R <rule>`, e.g. `snakemake -R five_tt`.
 
 ## Loops over a checkpoint
 
