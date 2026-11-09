@@ -19,6 +19,11 @@ other kinds, all in one rule from `examples/howto/Snakefile`:
 
 Several values can be given at once: `output(mean=m, n=len(values))`.
 
+The annotation decides whether an output is a file or a value, not the value itself: with
+`subjects: list[str]`, `output(subjects=['01', '02'])` is a value, and makes no file. A file output
+takes one name; several files from one job are a `JobLoop[Path]` (a `list[Path]` output is refused
+when the Snakefile is loaded).
+
 After `run()`, each output is checked: files and folders must exist, values must have been given
 and have the right type. An optional output that was not made is simply left out, and the
 receiving job gets `None`.

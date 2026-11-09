@@ -176,6 +176,39 @@ def _apply_parser(parser, value, wildcards):
     return parser(value, wildcards) if _parser_wants_wildcards(parser) else parser(value)
 
 
+def _output_kinds(output_model):
+    """The names of the file outputs (Path, Path | None, PathPrefix, JobLoop[Path]) and of the value
+    outputs (everything else) of an OutputModel. The annotation decides, not the type of a value."""
+    files, values = [], []
+    for key, field in output_model.model_fields.items():
+        is_file = _path_annotation(field.annotation)[0] or _loop_output_annotation(field.annotation)[0] is not None
+        (files if is_file else values).append(key)
+    return files, values
+
+
+def _is_list_of_paths(annotation):
+    """Whether an annotation is a list, tuple or set of paths, e.g. list[Path] (not JobLoop[Path])."""
+    import types
+    if _loop_output_annotation(annotation)[0] is not None:
+        return False
+    args = [a for a in typing.get_args(annotation) if a is not type(None)]
+    if typing.get_origin(annotation) in (typing.Union, types.UnionType):
+        return any(_is_list_of_paths(a) for a in args)
+    return (typing.get_origin(annotation) in (list, tuple, set, frozenset)
+            and any(a is not Ellipsis and _path_annotation(a)[0] for a in args))
+
+
+def _admits_dict(annotation):
+    """Whether an input annotation accepts a dict as it is, e.g. dict[str, Path] or Any."""
+    import collections.abc
+    import types
+    if annotation in (dict, typing.Any, object) or typing.get_origin(annotation) in (dict, collections.abc.Mapping):
+        return True
+    if typing.get_origin(annotation) in (typing.Union, types.UnionType):
+        return any(_admits_dict(a) for a in typing.get_args(annotation))
+    return isinstance(annotation, type) and issubclass(annotation, BaseModel)
+
+
 def _output_value(result, key):
     """Get output `key` from a JobResult, or the JobResult itself if key is None.
     Returns None if the output is not listed in the log file (e.g. because the job failed)."""
@@ -591,6 +624,11 @@ class SnakeRule:
             attrs = {k: v for k, v in vars(model).items() if k not in ('__dict__', '__weakref__')}
             setattr(cls, name, type(name, (Fixed,), attrs))
         for key, field in cls.OutputModel.model_fields.items():
+            if _is_list_of_paths(field.annotation):
+                raise TypeError(f"{cls.__name__}.OutputModel.{key}: an output cannot be a list of files "
+                                f"({_short_type_name(field.annotation)}); declare several files as "
+                                f"JobLoop[Path] with a file name pattern, e.g. Field('{key}_{{param}}.tck'), "
+                                f"and record each with output.{key}(param=...) or output.{key}.add(path, param=...)")
             if _loop_output_annotation(field.annotation)[0] is not None:
                 if not isinstance(field.default, str) or not _loop_output_keys(cls, field):
                     raise TypeError(f"{cls.__name__}.OutputModel.{key}: an output with several files needs a "
@@ -702,6 +740,14 @@ class SnakeRule:
                 pass
             else:
                 # concrete value passed directly — validate it for real, right now
+                if isinstance(value, dict) and not _admits_dict(expected_type):
+                    # pydantic would quietly turn it into a list of its keys
+                    cls = type(self).__name__
+                    raise TypeError(
+                        f"{cls}.set_input({key}=...): got a dict, but {cls}.{key} is "
+                        f"{_short_type_name(expected_type)}. For files with keys, give "
+                        f"JobLoop([path, ...], [dict(<key>=...), ...]) or JobLoop.from_pattern('.../{{<key>}}...'); "
+                        f"for files without keys, a list")
                 TypeAdapter(expected_type).validate_python(value)
 
         # promises that are not covered by model_fields (Extensible InputModel)
@@ -954,10 +1000,12 @@ class SnakeRule:
 
         previous = previous_run(log_path)  # read before JobMonitor replaces the job's file
 
+        file_outputs, value_outputs = _output_kinds(self.OutputModel)
         with JobMonitor(log_path, descr, result_path, output_patterns=output_patterns,
                         # an Extensible OutputModel allows undeclared outputs; otherwise a typo is an error
                         output_names=(None if self.OutputModel.model_config.get('extra') == 'allow'
                                       else list(self.OutputModel.model_fields)),
+                        file_outputs=file_outputs, value_outputs=value_outputs,
                         shell_context=rule_context, linemaps=_get_builder().linemaps,
                         params=params_dict, stamp_file=stamp, tmpdir_autodelete=self.tmpdir_autodelete,
                         threads=rule_context.get('threads', 1)) as job:
@@ -1163,7 +1211,8 @@ class SnakeRule:
                     logs = val.rule_or_loop.log_path(wildcards)
                     for log in (logs if isinstance(logs, list) else [logs]):
                         result = JobResult(log)
-                        for v in list(result._named_outputs.values()) + result._numbered_outputs:
+                        named = [v for n, v in result._named_outputs.items() if n not in result._value_outputs]
+                        for v in named + result._numbered_outputs:
                             if isinstance(v, (str, list, tuple)):
                                 add(result._resolve_value(v))
                             elif isinstance(v, dict):  # an output with several files

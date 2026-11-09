@@ -368,9 +368,16 @@ class JobResult():
     A rule that is connected to another rule without output name gets the other job's JobResult,
     with the same attribute access: `input.tracking.tracts`.
     """
-    def __init__(self, log_file, prefix=None, create=False, output_patterns=None, output_names=None):
+    def __init__(self, log_file, prefix=None, create=False, output_patterns=None, output_names=None,
+                 value_outputs=None, file_outputs=None):
         self._log_file = log_file
         self._output_names = output_names  # the outputs a rule declares (OutputModel), if known
+        # Which outputs are values and which are files is decided by the OutputModel's annotations,
+        # never by the Python type of a value: a list[str] is a value, not the parts of a path.
+        # The value outputs are recorded in the log, so that a reader knows them too.
+        self._typed = value_outputs is not None or file_outputs is not None
+        self._value_outputs = set(value_outputs or ())
+        self._file_outputs = set(file_outputs or ())
         self._create = create
         self._output_patterns = output_patterns or {}
         self._compiled_patterns = []
@@ -458,7 +465,7 @@ class JobResult():
         else:
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
-        if not isinstance(value, str):
+        if not isinstance(value, str) or name in self._value_outputs:
             return value
         path = self._resolve_value(value)
         # inside run() a file output is a Path, as its annotation says; when read, it is validated
@@ -513,11 +520,30 @@ class JobResult():
             raise TypeError(
                 f"JobResult.call takes only one positional or keyword argument, got {len(args)} + {len(kwargs)}."
             )
-        if kwargs:
+        if kwargs and not self._typed:
+            # JobMonitor used without a rule, in a plain Snakemake rule: no OutputModel to go by
             (name, value), = kwargs.items()
             self._named_outputs[name] = value
             if not isinstance(value, (str, list, tuple)):
-                return value  # a plain value, not a file name
+                return value
+        elif kwargs:
+            (name, value), = kwargs.items()
+            if name in self._file_outputs:
+                if isinstance(value, (list, tuple, set, dict)):
+                    raise TypeError(f"output '{name}' is a file, so output({name}=...) takes one file name, "
+                                    f"got a {type(value).__name__}; for several files, declare it as "
+                                    f"JobLoop[Path] with a file name pattern")
+                if isinstance(value, os.PathLike):
+                    value = os.fspath(value)
+            elif name in self._value_outputs or not isinstance(value, os.PathLike):
+                # a value: declared as one in the OutputModel, or an undeclared output (Extensible
+                # OutputModel) that is not given as a Path
+                self._value_outputs.add(name)
+                self._named_outputs[name] = value
+                return value
+            else:
+                value = os.fspath(value)  # an undeclared output given as a Path: a file
+            self._named_outputs[name] = value
         elif args:
             value, = args
             self._numbered_outputs.append(value)
@@ -530,6 +556,7 @@ class JobResult():
     def _apply_mapping(self, mapping):
         self._numbered_outputs.extend(mapping.get('by_number', []))
         self._named_outputs.update(mapping.get('by_name', {}))
+        self._value_outputs.update(mapping.get('values', []))
         self._errors.extend(mapping.get('errors', []))
         self._warnings.extend(mapping.get('warnings', []))
 
@@ -572,7 +599,10 @@ class JobResult():
         if self._numbered_outputs:
             mapping['by_number'] = self._numbered_outputs
         if self._named_outputs:
-            mapping['by_name'] = self._named_outputs        
+            mapping['by_name'] = self._named_outputs
+            values = sorted(n for n in self._named_outputs if n in self._value_outputs)
+            if values:
+                mapping['values'] = values
         if self._errors:
             mapping['errors'] = self._errors        
         if self._warnings:
@@ -624,7 +654,7 @@ class JobMonitor():
     It can also be used without snakeplusplus rules, in a plain Snakemake rule, as
     `with JobMonitor(log[0], 'my job') as job: ...`.
     """
-    def __init__(self,log_file,job_name='Job',result_folder_or_prefix=None,output_patterns=None,output_names=None,shell_context=None,linemaps=None,params=None,stamp_file=None,tmpdir_autodelete=True,threads=1):
+    def __init__(self,log_file,job_name='Job',result_folder_or_prefix=None,output_patterns=None,output_names=None,shell_context=None,linemaps=None,params=None,stamp_file=None,tmpdir_autodelete=True,threads=1,value_outputs=None,file_outputs=None):
         if isinstance(log_file,str):
             self.log_file = log_file
         else:
@@ -646,7 +676,7 @@ class JobMonitor():
             prefix = op.join(result_folder_or_prefix,'')
             
         self.result = JobResult(self.log_file,prefix=prefix,create=True,output_patterns=output_patterns,
-                                output_names=output_names)
+                                output_names=output_names,value_outputs=value_outputs,file_outputs=file_outputs)
         
         # allow JobMonitor to be run out-of-context
         self.started = datetime.now()

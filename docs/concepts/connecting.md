@@ -22,7 +22,11 @@ A value can be:
 | `fit.foreach(...).get_output('fa')` | the outputs of many jobs, see [Loops and checkpoints](loops-and-checkpoints.md) |
 | `fit.where(subject='template').get_output('fa')` | the output of one specific job |
 | `'data/sub-{subject}/dwi.mif'` | a file name; the wildcards of the job are filled in |
+| `['data/T1w.nii.gz', 'data/T2w.nii.gz']` | a list of file names, for a `list[Path]` or a `JobLoop[Path]` without keys |
+| `JobLoop.from_pattern('data/{modality}.nii.gz')` | existing files with keys from their names: `input.scans.get(modality='T2w')`; or `JobLoop(paths, [dict(modality=...), ...])` |
 | a function of the wildcards | file names, or a connection; see below |
+
+A dict is refused for a list or `JobLoop` input, because it would become the list of its keys.
 
 Every input of the `InputModel` without a default must be given; an input with a default, such as
 `mask: Path | None = None`, can be left out. A wrong name is reported with the names that exist:

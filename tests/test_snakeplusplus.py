@@ -2063,3 +2063,152 @@ def test_extra_env_names_are_checked():
         _check_extra_env({'MY-VAR': 1})
     with pytest.raises(TypeError, match='extra_env must be a dict'):
         _check_extra_env([('A', 1)])
+
+
+VALUE_OUTPUTS_SNAKEFILE = '''
+from pathlib import Path
+import snakeplusplus
+from snakeplusplus import SnakeRule, SnakeCheckpoint, target, Field, JobResult
+
+pathvars:
+    logs = 'logs',
+    results = 'results'
+
+snakeplusplus.configure(workflow.pathvars)
+
+class Find(SnakeCheckpoint):
+    class OutputModel:
+        subjects: list[str]
+        pairs: list[dict[str, str]]
+        label: str
+        seen: Path = Field('seen.txt')
+    def run(self, job, input, output, params, wildcards):
+        output(subjects=['01', '02'], pairs=[dict(subject='01'), dict(subject='02')], label='left')
+        output.seen.write_text(f'{output.label}|{output.subjects}')  # values, also inside run()
+
+def label_of(wildcards):
+    return [JobResult.from_checkpoint(checkpoints.find, wildcards).label]
+
+class Step(SnakeRule):
+    result_template = 'sub-{subject}'
+    class InputModel:
+        label: str
+    class OutputModel:
+        out: Path = Field('out.txt')
+    def run(self, job, input, output, params, wildcards):
+        output.out.write_text(input.label)
+
+class Tagged(SnakeRule):
+    result_template = 'tag-{tag}'
+    class OutputModel:
+        out: Path = Field('out.txt')
+    def run(self, job, input, output, params, wildcards):
+        output.out.write_text(wildcards.tag)
+
+find = Find()
+step = Step().set_input(label=find.get_output('label'))
+tagged = Tagged()
+runall = target(step.foreach(find.get_output('pairs')), tagged.foreach(tag=label_of))
+
+include: snakeplusplus.SNAKEFILE
+snakeplusplus.build(locals())
+'''
+
+
+def test_list_and_str_outputs_are_values_not_paths(tmp_path):
+    """Outputs that the OutputModel declares as values stay values: a list is not the parts of a
+    path (which made a folder per item), and a str is not a file name."""
+    (tmp_path / 'Snakefile').write_text(VALUE_OUTPUTS_SNAKEFILE)
+    p = subprocess.run([sys.executable, '-m', 'snakemake', '-c1'], capture_output=True, text=True, cwd=tmp_path)
+    assert p.returncode == 0, p.stdout + p.stderr
+    errors = list((tmp_path / 'logs').glob('*.error'))
+    assert not errors, [f.read_text() for f in errors]
+    # only the declared file: no folders named after list items
+    assert sorted(os.listdir(tmp_path / 'results' / 'find')) == ['seen.txt']
+    assert (tmp_path / 'results' / 'find' / 'seen.txt').read_text() == "left|['01', '02']"
+    for s in ['01', '02']:  # the str value, read by another rule
+        assert (tmp_path / 'results' / f'sub-{s}' / 'step' / 'out.txt').read_text() == 'left'
+    # ... and by a loop function, via JobResult.from_checkpoint()
+    assert (tmp_path / 'results' / 'tag-left' / 'tagged' / 'out.txt').read_text() == 'left'
+
+
+def _snakefile_with_rule(rule_code, connect):
+    return f'''
+from pathlib import Path
+import snakeplusplus
+from snakeplusplus import SnakeRule, target, Field, JobLoop
+
+pathvars:
+    logs = 'logs',
+    results = 'results'
+
+snakeplusplus.configure(workflow.pathvars)
+
+{rule_code}
+
+{connect}
+
+include: snakeplusplus.SNAKEFILE
+snakeplusplus.build(locals())
+'''
+
+
+def test_list_for_a_file_output_is_an_error(tmp_path):
+    (tmp_path / 'Snakefile').write_text(_snakefile_with_rule('''
+class Make(SnakeRule):
+    class OutputModel:
+        result: Path
+    def run(self, job, input, output, params, wildcards):
+        output(result=['a', 'b.txt'])
+''', 'make = Make()\nrunall = target(make)'))
+    p = subprocess.run([sys.executable, '-m', 'snakemake', '-c1'], capture_output=True, text=True, cwd=tmp_path)
+    error = (tmp_path / 'logs' / 'make.error').read_text()
+    assert "output(result=...) takes one file name, got a list" in error
+    assert 'JobLoop[Path]' in error
+    assert not (tmp_path / 'results' / 'make' / 'a').exists()
+
+
+def test_list_of_files_output_is_refused_when_loading(tmp_path):
+    (tmp_path / 'Snakefile').write_text(_snakefile_with_rule('''
+class Find(SnakeRule):
+    class OutputModel:
+        scans: list[Path]
+    def run(self, job, input, output, params, wildcards):
+        pass
+''', 'find = Find()\nrunall = target(find)'))
+    p = subprocess.run([sys.executable, '-m', 'snakemake', '-c1', '-n'], capture_output=True, text=True, cwd=tmp_path)
+    assert p.returncode != 0
+    assert 'Find.OutputModel.scans: an output cannot be a list of files' in p.stdout + p.stderr
+    assert 'JobLoop[Path]' in p.stdout + p.stderr
+
+
+@pytest.mark.parametrize('annotation', ['JobLoop[Path]', 'list[Path]'])
+def test_dict_for_a_list_input_is_refused_when_loading(tmp_path, annotation):
+    """A dict would quietly become the list of its keys, losing the file names."""
+    (tmp_path / 'Snakefile').write_text(_snakefile_with_rule(f'''
+class Take(SnakeRule):
+    class InputModel:
+        scans: {annotation}
+    def run(self, job, input, output, params, wildcards):
+        pass
+''', "take = Take().set_input(scans={'T1w': 'T1w.nii.gz'})\nrunall = target(take)"))
+    (tmp_path / 'T1w.nii.gz').write_text('')
+    p = subprocess.run([sys.executable, '-m', 'snakemake', '-c1', '-n'], capture_output=True, text=True, cwd=tmp_path)
+    assert p.returncode != 0
+    assert 'Take.set_input(scans=...): got a dict' in p.stdout + p.stderr
+    assert 'JobLoop.from_pattern(' in p.stdout + p.stderr
+
+
+def test_dict_for_a_dict_input_is_accepted(tmp_path):
+    (tmp_path / 'Snakefile').write_text(_snakefile_with_rule('''
+class Take(SnakeRule):
+    class InputModel:
+        names: dict[str, str]
+    class OutputModel:
+        out: Path = Field('out.txt')
+    def run(self, job, input, output, params, wildcards):
+        output.out.write_text(','.join(f'{k}={v}' for k, v in input.names.items()))
+''', "take = Take().set_input(names={'T1w': 'a', 'T2w': 'b'})\nrunall = target(take)"))
+    p = subprocess.run([sys.executable, '-m', 'snakemake', '-c1'], capture_output=True, text=True, cwd=tmp_path)
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert (tmp_path / 'results' / 'take' / 'out.txt').read_text() == 'T1w=a,T2w=b'
