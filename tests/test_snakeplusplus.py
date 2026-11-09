@@ -2212,3 +2212,124 @@ class Take(SnakeRule):
     p = subprocess.run([sys.executable, '-m', 'snakemake', '-c1'], capture_output=True, text=True, cwd=tmp_path)
     assert p.returncode == 0, p.stdout + p.stderr
     assert (tmp_path / 'results' / 'take' / 'out.txt').read_text() == 'T1w=a,T2w=b'
+
+
+RELOCATE_SNAKEFILE = '''
+from pathlib import Path
+import snakeplusplus
+from snakeplusplus import SnakeRule, SnakeCheckpoint, target, Field, JobLoop
+
+ROOT = Path(workflow.basedir)
+configfile: str(ROOT / 'config.yaml')
+
+pathvars:
+    logs = str(ROOT / 'logs'),
+    results = str(ROOT / 'results'),
+    resources = str(ROOT / 'resources')
+
+snakeplusplus.configure(workflow.pathvars)
+
+class Find(SnakeCheckpoint):
+    class OutputModel:
+        subjects: list[str]
+        ref: JobLoop[Path] = Field('{name}')
+    def run(self, job, input, output, params, wildcards):
+        output.ref.add(ROOT / 'resources' / 'ref.txt', name='ref')
+        output(subjects=['01', '02'])
+
+class Make(SnakeRule):
+    result_template = 'sub-{subject}'
+    class InputModel:
+        ref: JobLoop[Path]
+    class OutputModel:
+        out: Path = Field('out.txt')
+    def run(self, job, input, output, params, wildcards):
+        output.out.write_text(wildcards.subject + input.ref[0].read_text())
+
+class Collect(SnakeRule):
+    class InputModel:
+        outs: list[Path]
+    class OutputModel:
+        all: Path = Field('all.txt')
+    def run(self, job, input, output, params, wildcards):
+        output.all.write_text(','.join(p.read_text() for p in input.outs))
+
+find = Find()
+make = Make().set_input(ref=find.get_output('ref'))
+collect = Collect().set_input(outs=make.foreach(subject=find.get_output('subjects')).get_output('out'))
+everything = target(collect)
+
+include: snakeplusplus.SNAKEFILE
+snakeplusplus.build(locals())
+'''
+
+
+def _relocate_project(folder, config=''):
+    folder.mkdir(parents=True)
+    (folder / 'Snakefile').write_text(RELOCATE_SNAKEFILE)
+    (folder / 'config.yaml').write_text(config or '{}\n')
+    (folder / 'resources').mkdir()
+    (folder / 'resources' / 'ref.txt').write_text('r')
+
+
+def _snakemake(folder, *args):
+    p = subprocess.run([sys.executable, '-m', 'snakemake', '-c1', *args], capture_output=True, text=True, cwd=folder)
+    errors = list((folder / 'logs').glob('*.error')) if (folder / 'logs').exists() else []
+    assert p.returncode == 0 and not errors, p.stdout + p.stderr + ''.join(f.read_text() for f in errors)
+    return p
+
+
+def test_logs_write_paths_with_pathvars(tmp_path):
+    proj = tmp_path / 'proj'
+    _relocate_project(proj)
+    _snakemake(proj)
+    make_log = (proj / 'logs' / 'sub-01_make.log').read_text()
+    assert make_log.splitlines()[1] == '<results>/sub-01/make/'
+    find_log = (proj / 'logs' / 'find.log').read_text()
+    assert '"<resources>/ref.txt"' in find_log  # a file recorded from elsewhere, under a pathvar
+    assert '"01"' in find_log and '<results>/01' not in find_log  # values are left alone
+    for log in (make_log, find_log):  # what is read back: line 2 and the output list (not the messages)
+        assert str(proj) not in log.splitlines()[1] + log[log.rindex('```json'):]
+
+
+def test_moving_the_whole_workflow_needs_nothing_to_run_again(tmp_path):
+    _relocate_project(tmp_path / 'old' / 'proj')
+    _snakemake(tmp_path / 'old' / 'proj')
+    (tmp_path / 'new').mkdir()
+    shutil.move(tmp_path / 'old' / 'proj', tmp_path / 'new' / 'proj')
+    proj = tmp_path / 'new' / 'proj'
+    p = _snakemake(proj, '-n')
+    assert 'Nothing to be done' in p.stdout + p.stderr, p.stdout + p.stderr
+    # jobs that read the outputs of others find them at the new place
+    (proj / 'resources' / 'ref.txt').write_text('R')
+    _snakemake(proj, '-R', 'make')
+    assert (proj / 'results' / 'collect' / 'all.txt').read_text() == '01R,02R'
+
+
+def test_moving_only_the_results_with_a_pathvar_in_the_config(tmp_path):
+    proj = tmp_path / 'proj'
+    _relocate_project(proj)
+    _snakemake(proj)
+    shutil.move(proj / 'results', tmp_path / 'bigdisk')
+    (proj / 'config.yaml').write_text(f'pathvars:\n  results: {tmp_path / "bigdisk"}\n')
+    p = _snakemake(proj, '-n')
+    assert 'Nothing to be done' in p.stdout + p.stderr, p.stdout + p.stderr
+    _snakemake(proj, '-R', 'collect')
+    assert (tmp_path / 'bigdisk' / 'collect' / 'all.txt').read_text() == '01r,02r'
+    assert not (proj / 'results').exists()
+
+
+def test_logs_with_full_paths_are_still_read(tmp_path):
+    """Logs written before pathvars were used in them have the full path on line 2."""
+    proj = tmp_path / 'proj'
+    _relocate_project(proj)
+    _snakemake(proj)
+    for log in (proj / 'logs').glob('*.log'):
+        st = log.stat()
+        log.write_text(log.read_text().replace('<results>', str(proj / 'results'))
+                                      .replace('<resources>', str(proj / 'resources')))
+        os.utime(log, ns=(st.st_atime_ns, st.st_mtime_ns))
+    p = _snakemake(proj, '-n')
+    assert 'Nothing to be done' in p.stdout + p.stderr, p.stdout + p.stderr
+    _snakemake(proj, '-R', 'collect')
+    assert (proj / 'results' / 'collect' / 'all.txt').read_text() == '01r,02r'

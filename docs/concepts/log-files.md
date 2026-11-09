@@ -91,6 +91,14 @@ the count. A file output is found the same way, as the result folder (line 2) pl
 the mapping. A job whose log file is `.error` has no usable outputs: the jobs that depend on it
 fail too, or receive a `JobError` (see [Where errors go](errors.md)).
 
+## Moving a workflow
+
+A full path in the folder of a pathvar is written in Snakemake's notation: with
+`results = '/data/study/results'`, line 2 reads `<results>/text-fox/count_words/`. The current
+pathvars fill it in when the log is read. So a workflow can be moved, or its results given another
+folder with a `pathvars:` section in the config, without anything running again. Relative paths,
+as in the example above, are written as they are, and logs with full paths are still read.
+
 ## Behind the scenes: stamp files
 
 Snakemake decides what to run from files and their dates. Snakeplusplus gives it one small

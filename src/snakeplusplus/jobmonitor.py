@@ -279,6 +279,56 @@ def read_errors(log_file):
     return '\n'.join(errors) if errors else f'(see {error_file})'
 
 
+# Paths in log files: a full path under the folder of a pathvar (see configure()) is written in
+# Snakemake's notation, e.g. <results>/sub-01/fit/, and filled in with the current pathvars when it is
+# read. So the logs stay valid when the workflow moves, or when a pathvar is given another folder.
+_PATHVAR_FOLDERS = {}   # pathvar name -> absolute folder
+_PATHVAR_REF = re.compile(r'<([a-z][a-z0-9_]*)>')
+
+
+def set_pathvars(items):
+    """The pathvars for the paths in log files: {name: folder}, folders may refer to other
+    pathvars, e.g. '<results>/qc'. Relative folders are taken from the current directory."""
+    items = {k: str(v) for k, v in dict(items).items() if v}
+    folders = {}
+    for name, value in items.items():
+        for _ in range(len(items) + 1):  # nested references; cycles are refused by Snakemake
+            value, n = _PATHVAR_REF.subn(lambda m: items.get(m.group(1), m.group(0)), value)
+            if not n:
+                break
+        if _PATHVAR_REF.search(value):
+            continue  # an undefined reference
+        folder = op.normpath(op.abspath(value))
+        if op.dirname(folder) != folder:  # never the root of the file system
+            folders[name] = folder
+    _PATHVAR_FOLDERS.clear()
+    _PATHVAR_FOLDERS.update(folders)
+
+
+def to_pathvar(path):
+    """A full path as it is written in a log: <name>/rest if it lies in the folder of a pathvar (the
+    deepest one if several), otherwise unchanged."""
+    if not isinstance(path, str) or not op.isabs(path):
+        return path
+    best = None
+    for name, folder in _PATHVAR_FOLDERS.items():
+        if (path == folder or path.startswith(folder + op.sep)) and (best is None or len(folder) > len(_PATHVAR_FOLDERS[best])):
+            best = name
+    return path if best is None else f'<{best}>' + path[len(_PATHVAR_FOLDERS[best]):]
+
+
+def from_pathvar(path):
+    """A path read from a log, with a leading <name> replaced by the current folder of that pathvar."""
+    if isinstance(path, str) and path.startswith('<'):
+        m = _PATHVAR_REF.match(path)
+        if m:
+            if m.group(1) not in _PATHVAR_FOLDERS:
+                raise ValueError(f"a log file refers to <{m.group(1)}>, but there is no pathvar "
+                                 f"{m.group(1)!r} (pathvars: {', '.join(_PATHVAR_FOLDERS) or 'none'})")
+            return _PATHVAR_FOLDERS[m.group(1)] + path[m.end():]
+    return path
+
+
 # The previous run of a job, from its current file in any state (log_file is the `.log` name):
 # (start time, result prefix, output mapping), or None if there is none or it cannot be read.
 def previous_run(log_file):
@@ -288,7 +338,7 @@ def previous_run(log_file):
     try:
         with open(state_file, 'rt') as fp:
             m = re.search(r' started at (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d), saving output to$', fp.readline().rstrip('\n'))
-            prefix = fp.readline().rstrip('\n')
+            prefix = from_pathvar(fp.readline().rstrip('\n'))
         if not m or not prefix:
             return None
         started = datetime.strptime(m[1], '%Y-%m-%d %H:%M:%S')
@@ -403,7 +453,7 @@ class JobResult():
 
             with open(log_file, 'rt') as fp:
                 fp.readline()
-                self._prefix = fp.readline().rstrip('* \n')
+                self._prefix = from_pathvar(fp.readline().rstrip('* \n'))
             
             mapping = self._load_mapping_from_log()
             if mapping:
@@ -595,11 +645,19 @@ class JobResult():
 
 
     def _output_mapping(self):
+        def as_written(v):
+            # a full file name in the folder of a pathvar as <name>/..., see to_pathvar()
+            if isinstance(v, str):
+                return to_pathvar(v)
+            if isinstance(v, dict) and isinstance(v.get('files'), list):  # an output with several files
+                return {**v, 'files': [{**f, 'file': to_pathvar(f.get('file'))} for f in v['files']]}
+            return v
         mapping = dict()
         if self._numbered_outputs:
-            mapping['by_number'] = self._numbered_outputs
+            mapping['by_number'] = [as_written(v) for v in self._numbered_outputs]
         if self._named_outputs:
-            mapping['by_name'] = self._named_outputs
+            mapping['by_name'] = {n: v if n in self._value_outputs else as_written(v)
+                                  for n, v in self._named_outputs.items()}
             values = sorted(n for n in self._named_outputs if n in self._value_outputs)
             if values:
                 mapping['values'] = values
@@ -611,6 +669,8 @@ class JobResult():
 
 
     def _file(self, *args):
+        if args:
+            args = (from_pathvar(str(args[0])), *args[1:])  # e.g. <resources>/x, as written in a log
         if args and op.isabs(str(args[0])):
             # an existing file elsewhere, e.g. recorded with LoopOutput.add()
             return op.join(str(args[0]), *map(str, args[1:]))
@@ -706,7 +766,7 @@ class JobMonitor():
         self.running_log = replace_inner_extension(self.log_file,'.running')
         with open(self.running_log,'wt') as fp:
             # the result prefix as it is; the folder is created when the job writes there
-            fp.write(f'"{self.job_name}" started at {self.started:%Y-%m-%d %H:%M:%S}, saving output to\n{self.result._prefix}\n')
+            fp.write(f'"{self.job_name}" started at {self.started:%Y-%m-%d %H:%M:%S}, saving output to\n{to_pathvar(self.result._prefix)}\n')
             if self.params:
                 fp.write(f'and using parameters\n{params_to_json(self.params)}\n')
             else:

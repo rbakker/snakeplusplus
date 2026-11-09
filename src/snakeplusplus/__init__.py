@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from pydantic import BaseModel, Field, ConfigDict, TypeAdapter, Json
 from pydantic_core import PydanticUndefined
 
-from .jobmonitor import JobMonitor, JobResult, LoopOutput, JobError, UpstreamFailedError, previous_run, format_upstream_failures, format_exception_remapped, replace_inner_extension, job_state_file, JOB_STATES, STAMP_DIR, blocked_paths, permission_advice
+from .jobmonitor import JobMonitor, JobResult, LoopOutput, JobError, UpstreamFailedError, previous_run, format_upstream_failures, format_exception_remapped, replace_inner_extension, job_state_file, JOB_STATES, STAMP_DIR, blocked_paths, permission_advice, set_pathvars, from_pathvar
 
 import inspect
 import pathlib
@@ -1142,6 +1142,10 @@ class SnakeRule:
         def full(value, empty_ok=False):
             if isinstance(value, (list, tuple)):
                 value = op.join(*map(str, value))
+            try:
+                value = from_pathvar(value)  # e.g. <resources>/x, as written in the log
+            except ValueError:
+                return None  # a pathvar that no longer exists: not a file of this result folder
             if isinstance(value, str) and op.isabs(value):
                 return None  # an existing file elsewhere (LoopOutput.add()): never removed
             return prefix + value if isinstance(value, str) and (value or empty_ok) else None
@@ -2446,6 +2450,9 @@ def configure(pathvars,config_params=None,env=None,retry_failed=True,check_names
                          f"for the log files and the folder under which jobs get their result folders, "
                          f"e.g. configure(dict(logs='logs', results='results')) or, with a pathvars: "
                          f"section in the Snakefile, configure(workflow.pathvars)")
+    # paths in log files under a pathvar's folder are written as <name>/..., see to_pathvar()
+    items = pathvars.items if isinstance(getattr(pathvars, 'items', None), dict) else dict(pathvars)
+    set_pathvars(items)
     _builder = PipelineBuilder(pathvars,config_params or {},env or {},retry_failed,check_names)
 
 
