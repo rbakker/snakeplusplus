@@ -329,6 +329,40 @@ def from_pathvar(path):
     return path
 
 
+# The text of the output mapping per log file: {path: ((mtime_ns, size), text)}, see
+# JobResult._load_mapping_from_log()
+_MAPPING_TEXT = {}
+
+
+def _read_mapping_text(log_file, block=65536):
+    """The text of the output mapping at the end of a log file: from the last line that starts with
+    '{' to the closing Markdown code fence, or None. Reads the file from the end in blocks."""
+    with open(log_file, 'rb') as f:
+        f.seek(0, os.SEEK_END)
+        start = f.tell()
+        tail = b''
+        while True:
+            read_from = max(0, start - block)
+            f.seek(read_from)
+            tail = f.read(start - read_from) + tail
+            start = read_from
+            # the last '{' at the start of a line; one at the very start of the block is only a
+            # candidate if the block starts the file (otherwise the next round finds it)
+            i = max(tail.rfind(b'\n{'), tail.rfind(b'\r{'))
+            if i >= 0:
+                tail = tail[i + 1:]
+                break
+            if start == 0:
+                if not tail.startswith(b'{'):
+                    return None
+                break
+            block *= 2
+    json_str = tail.decode('ascii', errors='ignore').strip()
+    if '```' in json_str:  # closing Markdown code fence, maybe followed by a note
+        json_str = json_str[:json_str.rindex('```')]
+    return json_str
+
+
 # The previous run of a job, from its current file in any state (log_file is the `.log` name):
 # (start time, result prefix, output mapping), or None if there is none or it cannot be read.
 def previous_run(log_file):
@@ -612,30 +646,22 @@ class JobResult():
 
 
     def _load_mapping_from_log(self):
+        """The output mapping at the end of the log: the JSON from the last line that starts with
+        '{', up to the closing code fence. The text is remembered per log file (by its size and
+        modification time), because a log can be read many times while Snakemake builds its DAG,
+        e.g. a checkpoint's by every job that loops over its outputs."""
         try:
-            with open(self._log_file, 'rb') as f:
-                f.seek(0, os.SEEK_END)
-                pointer = f.tell()
-                buffer = []
-                while pointer > 0:
-                    pointer -= 1
-                    f.seek(pointer)
-                    char = f.read(1).decode('ascii', errors='ignore')
-                    buffer.append(char)
-                    if char == '{':
-                        is_sol = pointer == 0
-                        if not is_sol:
-                            f.seek(pointer - 1)
-                            if f.read(1).decode('ascii', errors='ignore') in ['\n', '\r']:
-                                is_sol = True
-                        if is_sol:
-                            json_str = "".join(reversed(buffer)).strip()
-                            if '```' in json_str:  # closing Markdown code fence, maybe followed by a note
-                                json_str = json_str[:json_str.rindex('```')]
-                            return json.loads(json_str)
+            st = os.stat(self._log_file)
+            key = (st.st_mtime_ns, st.st_size)
+            cached = _MAPPING_TEXT.get(self._log_file)
+            if cached is not None and cached[0] == key:
+                json_str = cached[1]
+            else:
+                json_str = _read_mapping_text(self._log_file)
+                _MAPPING_TEXT[self._log_file] = (key, json_str)
+            return json.loads(json_str) if json_str is not None else None
         except (OSError, json.JSONDecodeError):
             return None
-        return None
 
 
     def _resolve_value(self, value):

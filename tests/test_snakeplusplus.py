@@ -2333,3 +2333,25 @@ def test_logs_with_full_paths_are_still_read(tmp_path):
     assert 'Nothing to be done' in p.stdout + p.stderr, p.stdout + p.stderr
     _snakemake(proj, '-R', 'collect')
     assert (proj / 'results' / 'collect' / 'all.txt').read_text() == '01r,02r'
+
+
+@pytest.mark.parametrize('block', [1, 7, 64, 65536])
+def test_reading_the_output_mapping_of_a_log(tmp_path, block):
+    """The mapping is found from the end of the log in blocks, whatever the block size."""
+    from snakeplusplus.jobmonitor import _read_mapping_text
+    mapping = '{\n  "by_name": {\n    "a": {"x": 1},\n    "b": "b.txt"\n  }\n}'
+    cases = {
+        'log': f'"job" started at ..., saving output to\nresults/\n{{"not": "this"}}\nOutput mapping\n\n```json\n{mapping}\n```\n',
+        'note': f'header\n```json\n{mapping}\n```\nnote after the fence\n',
+        'crlf': f'header\r\n```json\r\n{mapping}\r\n```\r\n',
+        'start': f'{mapping}\n',
+        'none': 'header\nno mapping { here\n',
+    }
+    for name, text in cases.items():
+        f = tmp_path / f'{name}.log'
+        f.write_bytes(text.encode())
+        found = _read_mapping_text(str(f), block=block)
+        if name == 'none':
+            assert found is None
+        else:
+            assert json.loads(found) == json.loads(mapping), (name, found)
