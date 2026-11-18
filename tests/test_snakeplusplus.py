@@ -1209,7 +1209,8 @@ def test_tutorial_step1(tmp_path):
     assert p.returncode == 0, p.stderr
     assert sorted(str(f.relative_to(tmp_path)) for f in tmp_path.glob('[lr]*/**/*') if f.is_file()) == [
         'logs/Bonjour_say_hello.log', 'logs/Hello_say_hello.log', 'logs/Hola_say_hello.log', 'logs/everything.log',
-        'results/Bonjour/say_hello/hello.txt', 'results/Hello/say_hello/hello.txt', 'results/Hola/say_hello/hello.txt']
+        'results/Bonjour/say_hello/hello.txt', 'results/Hello/say_hello/hello.txt', 'results/Hola/say_hello/hello.txt',
+        'results/everything/diagram.html', 'results/everything/timeline.html']
     assert jobs_run(run_tutorial(tmp_path, 'step1')) == []
     (tmp_path / 'logs/Hola_say_hello.log').unlink()
     assert jobs_run(run_tutorial(tmp_path, 'step1')) == ['everything', 'say_hello']
@@ -2374,3 +2375,109 @@ def test_pipeline_template(tmp_path):
     assert p.returncode == 0, p.stdout + p.stderr
     assert (folder / 'results/sample-world/greet/greeting.txt').read_text() == 'Hello, world!\n'
     assert (folder / 'logs/sample-snakemake_greet.log').exists()
+
+
+MEMORY_SNAKEFILE = """
+import sys
+from pathlib import Path
+import snakeplusplus
+from snakeplusplus import SnakeRule, target, Field
+snakeplusplus.configure(dict(logs='logs', results='results'), options=config.get('options'))
+
+ALLOCATE = "x = bytearray({mb} * 2**20); x[::4096] = bytes(len(x[::4096]))"
+
+class Memory(SnakeRule):
+    class OutputModel:
+        done: Path = Field('done.txt')
+    def run(self, job, input, output, params, wildcards):
+        job.run([sys.executable, '-c', ALLOCATE.format(mb=200)])
+        job.run([sys.executable, '-c', 'pass'])
+        job.shell(f"{sys.executable} -c '{ALLOCATE.format(mb=120)}' | cat")
+        job.run(['no-such-tool'], fail_on_error=False)
+        output.done.write_text('done')
+
+class Failing(SnakeRule):
+    class OutputModel:
+        done: Path = Field('done.txt')
+    def run(self, job, input, output, params, wildcards):
+        job.run(['sh', '-c', 'exit 3'])
+
+memory = Memory()
+failing = Failing()
+everything = target(memory)
+with_failure = target(memory, failing)
+"""
+
+
+def test_memory_and_duration_per_command(tmp_path):
+    from snakeplusplus.timeline import read_log
+    p = run_targets(tmp_path, MEMORY_SNAKEFILE)
+    assert p.returncode == 0, p.stdout + p.stderr
+    log = (tmp_path / 'logs/memory.error').read_text()   # no-such-tool fails it
+    assert 'no-such-tool: No such file or directory' in log
+    job = read_log(str(tmp_path / 'logs/memory.error'))
+    peaks = [c['peak'] / 2**20 for c in job['commands'][:3]]
+    assert [c['exit_code'] for c in job['commands']] == [0, 0, 0, 127]
+    assert 200 <= peaks[0] < 230                  # the command's own memory, not that of the job's Python
+    assert peaks[1] < 40                          # a small command stays small
+    assert 120 <= peaks[2] < 150                  # a shell script is measured as well
+    assert 200 <= job['peak_commands'] / 2**20 < 230 and job['peak_python']
+    assert job['commands'][3]['peak'] is None     # it never started
+    assert job['state'] == 'error' and job['error'].startswith('no-such-tool exited with code 127')
+
+
+def test_target_writes_diagram_and_timeline(tmp_path):
+    from snakeplusplus.timeline import read_log
+    p = run_targets(tmp_path, MEMORY_SNAKEFILE, 'with_failure')
+    assert p.returncode == 0, p.stdout + p.stderr
+    # written also when a job it depends on failed
+    assert (tmp_path / 'logs/with_failure.error').exists()
+    page = (tmp_path / 'results/with_failure/timeline.html').read_text()
+    assert 'failing' in page and 'memory' in page and '../../logs/failing.error' in page
+    assert 'Diagram of with_failure' in (tmp_path / 'results/with_failure/diagram.html').read_text()
+    assert 'Timeline: results/with_failure/timeline.html' in (tmp_path / 'logs/with_failure.error').read_text()
+    # switched off in the config
+    p = run_targets(tmp_path, MEMORY_SNAKEFILE, 'everything', '--config', 'options={"timeline": false}')
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert (tmp_path / 'results/everything/diagram.html').exists()
+    assert not (tmp_path / 'results/everything/timeline.html').exists()
+
+
+def test_options_are_checked():
+    import snakeplusplus
+    with pytest.raises(ValueError, match=r"unknown option\(s\) timelines; the options are: diagram \(default True\)"):
+        snakeplusplus.configure(dict(logs='logs', results='results'), options={'timelines': False})
+    with pytest.raises(ValueError, match="option timeline must be true or false"):
+        snakeplusplus.configure(dict(logs='logs', results='results'), options={'timeline': 'no'})
+
+
+def test_timeline_of_a_target(tmp_path):
+    # the jobs of a target, whichever runs made them, with totals and the critical path
+    shutil.copytree(HERE.parent / 'examples/concepts/data', tmp_path / 'data')
+    loops = str(HERE.parent / 'examples/concepts/loops.smk')
+    def snakemake(*args):
+        return subprocess.run([sys.executable, '-m', 'snakemake', '-s', loops, '-c2', '--directory', str(tmp_path),
+                               *args], capture_output=True, text=True)
+    assert snakemake('test_run').returncode == 0            # a preliminary target first
+    assert snakemake().returncode == 0                       # then the rest
+    from snakeplusplus.diagram import load_pipeline, rules_for
+    from snakeplusplus.timeline import collect
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        builder = load_pipeline(loops)
+        runs, totals, critical, not_run = collect(builder, builder.rules['everything'], exclude_target=True)
+        assert totals['failed'] == 0 and not not_run and totals['succeeded'] == totals['jobs']
+        assert totals['critical'] <= totals['compute']
+        assert critical and all(log in runs for log in critical)
+        # one job of measure is shared with test_run, and counted once
+        assert sum(j['rule'] == 'measure' for j in runs.values()) == 6
+        # the diagram of a target has only the rules it needs
+        assert set(rules_for(builder, builder.rules['test_run'])) == {'measure', 'test_run'}
+        assert 'find_sessions' in rules_for(builder, builder.rules['everything'])
+    finally:
+        os.chdir(cwd)
+    p = subprocess.run([sys.executable, '-m', 'snakeplusplus.timeline', loops, '--directory', str(tmp_path),
+                        '-t', 'test_run', '-o', str(tmp_path / 'tl.html')], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert 'Timeline of test_run' in (tmp_path / 'tl.html').read_text()

@@ -11,7 +11,7 @@ workdir: str(Path(workflow.basedir).parent)
 configfile: 'config/config.yaml'
 
 # logs/ and results/ come from Snakemake's pathvars; add umask=0o002 to share the pipeline
-snakeplusplus.configure(workflow.pathvars, config.get('params'))
+snakeplusplus.configure(workflow.pathvars, config.get('params'), options=config.get('snakeplusplus'))
 
 RESOURCES = Path(workflow.pathvars.get('resources'))
 SAMPLES = json.loads(Path(config['samples']).read_text())

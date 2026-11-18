@@ -1026,6 +1026,8 @@ class SnakeRule:
                 raise JobError("these input files do not exist:\n" + '\n'.join(missing))
             if previous:
                 self._remove_previous_outputs(job, previous, wildcards, job_inputs)
+            if isinstance(self, TargetRule):
+                self._write_pages(job)
             failed = self._check_failed_inputs(job, wildcards, job_inputs)
             inputs = self._validated_inputs(self._resolved_inputs(wildcards, failed, job_inputs))
             self.run(job, inputs, job.result, params, wildcards)
@@ -1680,6 +1682,7 @@ def _checkpoint_values(promise, form, where):
             builder.checkpoint_cache[cache_key] = value
         return builder.checkpoint_cache[cache_key]
     checkpoint_output.__name__ = f'{rule.name}.{key}'
+    checkpoint_output._checkpoint_rule = rule  # for the diagram of a target
     return checkpoint_output
 
 
@@ -2000,12 +2003,41 @@ class SnakeCheckpoint(SnakeRule):
 
 
 class TargetRule(SnakeRule):
+    """A target: the jobs to make together, see `target()`. When its job runs, it writes a diagram
+    and a timeline of the jobs it depends on into its result folder, unless switched off with
+    `configure(..., options={'diagram': False, 'timeline': False})`."""
     class InputModel(Extensible):
         pass
+
+    class OutputModel:
+        diagram: pathlib.Path | None = Field('diagram.html', description='the rules of this target')
+        timeline: pathlib.Path | None = Field('timeline.html', description='when its jobs ran, how long they took, their memory')
 
     default_target = True
     def run(self,job,input,output,params,wildcards):
         print('All jobs done.')
+
+    def _write_pages(self, job):
+        """The diagram and the timeline, also when a job it depends on failed: then they are most
+        useful. Problems are reported in the log, and do not fail the target."""
+        options = _get_builder().options
+        builder = _get_builder()
+        if options.get('diagram', True):
+            try:
+                from .diagram import create_diagram, rules_for
+                path = job.result.diagram
+                create_diagram(builder, str(path), f'Diagram of {self.name}', rules=rules_for(builder, self))
+                job.log(f'Diagram: {path}')
+            except Exception as e:
+                job.log(f'Warning: could not write the diagram: {type(e).__name__}: {e}')
+        if options.get('timeline', True):
+            try:
+                from .timeline import create_timeline
+                path = job.result.timeline
+                create_timeline(builder, self, str(path), f'Timeline of {self.name}', exclude_target=True)
+                job.log(f'Timeline: {path}')
+            except Exception as e:
+                job.log(f'Warning: could not write the timeline: {type(e).__name__}: {e}')
 
 
 def _undefined_names(func):
@@ -2065,6 +2097,7 @@ class PipelineBuilder:
         self.is_main_process = True  # False when Snakemake re-parses the Snakefile to run a job
         self.execution_started = False  # True once Snakemake starts running jobs (not in a dry run)
         self.syncing = False      # True while _sync_job_states() works out which jobs are outdated
+        self.options = dict(_OPTIONS)  # see configure(options=...)
         self.checkpoints = None   # Snakemake's `checkpoints`, for loops over a checkpoint's output
         self.checkpoint_cache = {}  # (log file, output, modification time) -> value of a checkpoint output
         self.missing_reported = set()  # (log file, input file) that were reported as missing
@@ -2413,7 +2446,11 @@ def _apply_umask_to_snakemake_folder(umask):
             pass  # the load-time check reports what remains a problem
 
 
-def configure(pathvars,config_params=None,env=None,retry_failed=True,check_names=True,umask=None):
+# settings of snakeplusplus itself, see configure(options=...)
+_OPTIONS = {'diagram': True, 'timeline': True}
+
+
+def configure(pathvars,config_params=None,env=None,retry_failed=True,check_names=True,umask=None,options=None):
     """Set up snakeplusplus; call it in the Snakefile before the rules are created.
 
     Args:
@@ -2428,6 +2465,9 @@ def configure(pathvars,config_params=None,env=None,retry_failed=True,check_names
             write it too, and colleagues can continue the pipeline. It applies to the jobs and the
             tools they run, whatever the umask of the person who runs the pipeline. Default: that
             person's own umask.
+        options: Settings of snakeplusplus itself, e.g. from a `snakeplusplus:` section in the
+            config: `diagram` and `timeline` (both True by default) let each target write a
+            diagram and a timeline of its jobs into its result folder when it finishes.
 
     Example:
         ```python
@@ -2453,7 +2493,18 @@ def configure(pathvars,config_params=None,env=None,retry_failed=True,check_names
     # paths in log files under a pathvar's folder are written as <name>/..., see to_pathvar()
     items = pathvars.items if isinstance(getattr(pathvars, 'items', None), dict) else dict(pathvars)
     set_pathvars(items)
+    options = dict(options or {})
+    unknown = sorted(set(options) - set(_OPTIONS))
+    if unknown:
+        raise ValueError(f"configure(): unknown option(s) {', '.join(unknown)}; the options are: "
+                         + ', '.join(f'{k} (default {v})' for k, v in _OPTIONS.items()))
+    for k, v in options.items():
+        if isinstance(v, str) and v.lower() in ('true', 'false'):
+            options[k] = v.lower() == 'true'  # e.g. from snakemake --config on the command line
+        elif not isinstance(v, bool):
+            raise ValueError(f"configure(): option {k} must be true or false, got {v!r}")
     _builder = PipelineBuilder(pathvars,config_params or {},env or {},retry_failed,check_names)
+    _builder.options = {**_OPTIONS, **options}
 
 
 def target(*rules_or_loops):

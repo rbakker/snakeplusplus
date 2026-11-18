@@ -22,6 +22,43 @@ A rule with wildcards needs a loop or `where()`, since otherwise it is not clear
 ValueError: target(): rule SubjectMean has wildcards {subject}; use foreach(...)
 ```
 
+## A diagram and a timeline
+
+When a target's job runs, it writes two pages into its result folder, e.g. `results/test_run/`:
+
+- **`diagram.html`**: the rules that this target needs and how they are connected, with a
+  description of each rule, as `snakeplusplus-diagram` makes it for the whole pipeline;
+- **`timeline.html`**: when each of the target's jobs ran, with the commands inside each job,
+  failed jobs in red, and a link to each job's log file. It also gives the totals: the compute
+  time (the sum of all job durations), the critical path (the longest chain of jobs that wait for
+  each other, so the shortest possible duration with enough cores), and a table per rule with
+  the median and maximum time and memory of its jobs.
+
+The timeline is made from the log files of the jobs that the target depends on, whichever
+Snakemake runs made them. So a target gives the same totals whether it was made in one run, or
+in several, e.g. after a preliminary target that shares part of its jobs. Long waits between
+runs are drawn shortened, with their duration.
+
+The pages are also written when a job that the target depends on failed: the target still ends
+as `.error`, but its timeline shows which jobs failed, and why. A target's job runs again
+whenever one of its jobs ran, so its pages are always up to date.
+
+Both can be switched off in the config, in a `snakeplusplus:` section that the Snakefile passes
+to `configure()`:
+
+```yaml title="config/config.yaml"
+snakeplusplus:
+  diagram: true
+  timeline: false
+```
+
+```python
+snakeplusplus.configure(workflow.pathvars, config.get('params'), options=config.get('snakeplusplus'))
+```
+
+`snakeplusplus-timeline` writes the timeline of a target without running anything:
+`snakeplusplus-timeline -t test_run` writes `test_run-timeline.html` in the pipeline folder.
+
 ## Names
 
 The name of a target is the name of its variable: `test_run = target(...)` is run with

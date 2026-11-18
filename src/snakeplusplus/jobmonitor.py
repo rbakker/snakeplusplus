@@ -1,4 +1,5 @@
 import os
+import sys
 from os import path as op
 from datetime import datetime
 import traceback
@@ -200,6 +201,78 @@ def _extra_env_text(extra):
         return ''
     return ' (with ' + ', '.join(f'{k} unset' if v is None else f'{k}={shlex.quote(v)}'
                                  for k, v in extra.items()) + ')'
+
+
+# Runs a command and writes its peak memory to a file. A process started by Python counts the
+# memory of the Python process that started it in its own peak (on Linux, the high-water mark
+# carries over the fork), so the command is started from this small process instead of from the
+# job's: its peak is then the command's own, plus at most this launcher's ~10 MB.
+_LAUNCHER = '''
+import resource, signal, subprocess, sys
+report, cmd = sys.argv[1], sys.argv[2:]
+try:
+    child = subprocess.Popen(cmd)
+except OSError as e:
+    print(f"{cmd[0]}: {e.strerror}", file=sys.stderr)
+    sys.exit(127)
+for sig in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(sig, lambda s, f: child.send_signal(s))
+code = child.wait()
+with open(report, "w") as f:
+    f.write(str(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss))
+sys.exit(code if code >= 0 else 128 - code)
+'''
+
+
+def _measured(report, cmd):
+    """`cmd`, started through the launcher that measures its peak memory."""
+    return [sys.executable, '-I', '-S', '-c', _LAUNCHER, report, *cmd]
+
+
+def _read_peak(report):
+    """The peak memory in bytes that the launcher wrote, or None; removes the file."""
+    try:
+        with open(report) as f:
+            return _maxrss_bytes(int(f.read().strip() or 0))
+    except (OSError, ValueError):
+        return None
+    finally:
+        try:
+            os.remove(report)
+        except OSError:
+            pass
+
+
+def _maxrss_bytes(maxrss):
+    """ru_maxrss in bytes: it is in kilobytes on Linux, in bytes on macOS."""
+    if not maxrss:
+        return None
+    return maxrss if sys.platform == 'darwin' else maxrss * 1024
+
+
+def _job_memory_text(commands):
+    """', peak memory 2.3 GB (commands), 231 MB (Python)' for the last line of a job: the highest
+    peak of its commands, and that of the job's own Python process."""
+    import resource
+    python = _maxrss_bytes(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    parts = []
+    if commands:
+        parts.append(f'{format_memory(commands)} (commands)')
+    if python:
+        parts.append(f'{format_memory(python)} (Python)')
+    return ', peak memory ' + ', '.join(parts) if parts else ''
+
+
+def format_memory(n_bytes):
+    """'331 MB', '2.3 GB': MB below 1 GB, otherwise GB with one decimal (units of 1024)."""
+    mb = n_bytes / 1024 ** 2
+    return f'{mb:.0f} MB' if mb < 1024 else f'{mb / 1024:.1f} GB'
+
+
+def parse_memory(text):
+    """Bytes from '331 MB' or '2.3 GB'."""
+    value, unit = text.split()
+    return float(value) * 1024 ** {'KB': 1, 'MB': 2, 'GB': 3, 'TB': 4}[unit]
 
 
 def format_command(cmd):
@@ -834,7 +907,7 @@ class JobMonitor():
         if exc_type is not None and not issubclass(exc_type, Exception):
             # KeyboardInterrupt/SystemExit: the job was cancelled. No stamp file is written,
             # so Snakemake will rerun the job next time.
-            self.log(f'"{self.job_name}" was cancelled after {format_elapsed(elapsed)} (h:mm:ss, {exc_type.__name__}).')
+            self.log(f'"{self.job_name}" was cancelled after {format_elapsed(elapsed)} (h:mm:ss, {exc_type.__name__}){_job_memory_text(getattr(self, '_commands_peak', None))}.')
             self._write_mapping()  # so that partial outputs can be cleaned up when the job reruns
             stale_log = replace_inner_extension(self.log_file, '.stale')
             os.rename(self.running_log, stale_log)
@@ -843,7 +916,7 @@ class JobMonitor():
 
         if exc_type is None:
             # Process is ready.
-            self.log(f'"{self.job_name}" completed in {format_elapsed(elapsed)} (h:mm:ss).')
+            self.log(f'"{self.job_name}" completed in {format_elapsed(elapsed)} (h:mm:ss){_job_memory_text(getattr(self, '_commands_peak', None))}.')
         else:
             # An error occured. Report it: the message first, then where it happened in the
             # user's code (with line numbers of the Snakefile, via Snakemake's linemaps).
@@ -865,7 +938,7 @@ class JobMonitor():
                         pass  # the advice is a bonus; the error itself is reported anyway
                 err = message + '\n' + ''.join(where).rstrip()
             self.error(err)
-            self.log(f'"{self.job_name}" failed after {format_elapsed(elapsed)} (h:mm:ss).')
+            self.log(f'"{self.job_name}" failed after {format_elapsed(elapsed)} (h:mm:ss){_job_memory_text(getattr(self, '_commands_peak', None))}.')
 
         self._write_mapping()
         final_log = replace_inner_extension(self.log_file, '.error') if self.result._errors else self.log_file
@@ -987,12 +1060,13 @@ class JobMonitor():
         # the command's output goes into a Markdown code block, closed even if the command
         # raises (e.g. a timeout), so that whatever follows is not swallowed by the block
         start = self._open_output_block()
+        begin = datetime.now()
         try:
-            p, output = self._run_process(cmd, cwd, timeout, env, update_interval, formatter)
+            return_code, output, peak = self._run_process(cmd, cwd, timeout, env, update_interval, formatter)
         finally:
             self._close_output_block(start)
+        self._command_finished(begin, return_code, peak)
 
-        return_code = p.returncode
         if return_code != 0:
             # the command's output is already in the log; the error only says what failed
             # this job will end as .error, so that is the file the reader should open
@@ -1007,34 +1081,53 @@ class JobMonitor():
 
 
     def _run_process(self, cmd, cwd, timeout, env, update_interval, formatter):
-        if update_interval is not None:
-            p = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                cwd=cwd,
-                env=env,
-                bufsize=1
-            )
+        """Run the command; returns its exit code, its output (stdout and stderr together) and its
+        peak memory in bytes (of the process and the processes it started), or None."""
+        import signal
+        import threading
+        report = tempfile.NamedTemporaryFile(prefix='snakeplusplus-peak-', delete=False)
+        report.close()
+        p = subprocess.Popen(_measured(report.name, [str(c) for c in cmd]), stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, cwd=cwd, env=env, bufsize=1)
+        result = {}
 
-            output = self._periodic_log(p.stdout, update_interval, formatter)
+        def read():
+            if update_interval is not None:
+                result['output'] = self._periodic_log(p.stdout, update_interval, formatter)
+            else:
+                result['output'] = p.stdout.read()
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        timer, timed_out = None, threading.Event()
+        if timeout is not None:
+            def kill():
+                timed_out.set()
+                p.send_signal(signal.SIGTERM)  # the launcher passes it on to the command
+            timer = threading.Timer(timeout, kill)
+            timer.start()
+        try:
             p.wait()
-        else:
-            p = subprocess.run(
-                cmd,
-                cwd=cwd,
-                timeout=timeout,
-                env=env,
-                capture_output=True,
-                text=True
-            )
+        finally:
+            if timer is not None:
+                timer.cancel()
+        reader.join()
+        p.stdout.close()
+        peak = _read_peak(report.name)
+        output = result.get('output', '')
+        if update_interval is None and output:
+            self.log(escape_fences(output.rstrip("\n")), time_it=False)
+        if timed_out.is_set():
+            raise subprocess.TimeoutExpired(cmd, timeout, output=output)
+        return p.returncode, output, peak
 
-            # Log stdout
-            output = (p.stdout or "") + (p.stderr or "")
-            if output:
-                self.log(escape_fences(output.rstrip("\n")), time_it=False)
-        return p, output
+
+    def _command_finished(self, begin, return_code, peak):
+        """The line after a command: its duration, exit code and peak memory. The timeline reads it."""
+        if peak is not None:
+            self._commands_peak = max(getattr(self, '_commands_peak', 0), peak)
+        memory = 'unknown' if peak is None else format_memory(peak)
+        self.log(f'Command finished in {format_elapsed(datetime.now() - begin)}: '
+                 f'exit code {return_code}, peak memory {memory}')
                 
     
     _OUTPUT_HEADER = 'Output:\n\n```\n'
@@ -1073,10 +1166,19 @@ class JobMonitor():
         exports = ''.join(f'unset {k}; ' if v is None else f'export {k}={shlex.quote(v)}; '
                           for k, v in extra.items())
         start = self._open_output_block()
+        report = tempfile.NamedTemporaryFile(prefix='snakeplusplus-peak-', delete=False)
+        report.close()
+        begin = datetime.now()
+        return_code = 0
         try:
             # the script is used as it is (usually an f-string): braces are escaped, so that
             # Snakemake's shell() does not fill them in a second time, e.g. in awk '{print $1}'
-            command = f'set +euo pipefail; exec >> {shlex.quote(self.running_log)} 2>&1; ' + exports + script
+            measured = shlex.join(_measured(report.name, ['bash', '-c', exports + script]))
+            command = f'set +euo pipefail; exec >> {shlex.quote(self.running_log)} 2>&1; ' + measured
             sh(command.replace('{', '{{').replace('}', '}}'), **self.shell_context)
+        except subprocess.CalledProcessError as e:
+            return_code = e.returncode
+            raise
         finally:
             self._close_output_block(start)
+            self._command_finished(begin, return_code, _read_peak(report.name))

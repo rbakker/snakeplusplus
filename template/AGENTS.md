@@ -104,3 +104,7 @@ the Snakefile and in `config/config.yaml`, the entries of `config/samples.json`,
   used in `run()`, without running anything.
 - `snakeplusplus-diagram` writes `Snakefile-diagram.html`: a diagram of the pipeline, and a
   description of every rule.
+- Each target, when it finishes, writes `results/<target>/diagram.html` and
+  `results/<target>/timeline.html`: the timeline shows which jobs failed, how long each job and
+  command took, and their peak memory. `snakeplusplus-timeline -t <target>` writes it without
+  running anything.

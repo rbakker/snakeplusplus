@@ -47,16 +47,19 @@ logs/everything.log
 results/Bonjour/say_hello/hello.txt
 results/Hello/say_hello/hello.txt
 results/Hola/say_hello/hello.txt
+results/everything/diagram.html
+results/everything/timeline.html
 ```
 
-Every job has exactly one log file. This is `logs/Hello_say_hello.log`:
+Every job has exactly one log file. The target `everything` also wrote a diagram of the pipeline
+and a timeline of its jobs (see [Targets](concepts/targets.md#a-diagram-and-a-timeline)). This is `logs/Hello_say_hello.log`:
 
 ````
 "say_hello(SayHello)<greeting=Hello>" started at 2026-10-04 21:25:30, saving output to
 results/Hello/say_hello/
 
 
-[0:00:00] "say_hello(SayHello)<greeting=Hello>" completed in 0:00:00 (h:mm:ss).
+[0:00:00] "say_hello(SayHello)<greeting=Hello>" completed in 0:00:00 (h:mm:ss), peak memory 98 MB (Python).
 
 Output mapping
 
@@ -114,8 +117,12 @@ results/Hello/convert_to_upper/
 tr '[:lower:]' '[:upper:]' < results/Hello/say_hello/hello.txt > results/Hello/convert_to_upper/upper.txt
 ```
 
-[0:00:00] "convert_to_upper(ConvertToUpper)<greeting=Hello>" completed in 0:00:00 (h:mm:ss).
+[0:00:00] Command finished in 0:00:00: exit code 0, peak memory 13 MB
+[0:00:00] "convert_to_upper(ConvertToUpper)<greeting=Hello>" completed in 0:00:00 (h:mm:ss), peak memory 13 MB (commands), 98 MB (Python).
 ````
+
+Each command ends with a line that says how long it took and how much memory it used at most;
+the last line gives the same for the whole job.
 
 The log files are plain text, laid out as Markdown, so they also read well in a Markdown viewer.
 

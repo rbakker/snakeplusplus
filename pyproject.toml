@@ -23,6 +23,7 @@ docs = ["mkdocs-material", "mkdocstrings[python]"]
 
 [project.scripts]
 snakeplusplus-diagram = "snakeplusplus.diagram:main"
+snakeplusplus-timeline = "snakeplusplus.timeline:main"
 
 [project.urls]
 Documentation = "https://rbakker.github.io/snakeplusplus/"

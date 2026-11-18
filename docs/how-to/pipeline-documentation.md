@@ -32,4 +32,7 @@ The descriptions come from the code: the docstring of the rule class, and
 --8<-- "examples/concepts/dwi.smk:denoise"
 ```
 
+Each target also writes a diagram of only the rules it needs, and a timeline of its jobs, when it
+finishes; see [A diagram and a timeline](../concepts/targets.md#a-diagram-and-a-timeline).
+
 The tutorial shows an example: [Step 5](../getting-started.md#step-5-a-diagram-of-the-pipeline).

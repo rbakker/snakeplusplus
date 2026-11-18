@@ -201,8 +201,25 @@ def rule_card(name, rule):
 </div>"""
 
 
-def create_diagram(builder, output_path, title='Pipeline diagram'):
-    rules = builder.rules
+def rules_for(builder, target):
+    """The rules that `target` needs, directly or through other rules, in the order of the
+    pipeline: those of the jobs it depends on, and the checkpoints that define its loops."""
+    from .timeline import target_jobs
+    jobs, _ = target_jobs(builder, target)
+    needed = {id(rule) for rule, _ in jobs.values()}
+    for rule, _ in list(jobs.values()):
+        for val in rule.inputs.values():
+            loop = val.rule_or_loop if isinstance(val, OutputPromise) else val
+            for level in getattr(loop, 'levels', []):
+                fn = level[-1]
+                if getattr(fn, '_checkpoint_rule', None) is not None:
+                    needed.add(id(fn._checkpoint_rule))
+    return {name: rule for name, rule in builder.rules.items() if id(rule) in needed}
+
+
+def create_diagram(builder, output_path, title='Pipeline diagram', rules=None):
+    """Write the diagram of the pipeline, or of only these `rules` (e.g. from `rules_for()`)."""
+    rules = builder.rules if rules is None else rules
     cards = ''.join(rule_card(name, rule) for name, rule in rules.items())
     page = f"""<!DOCTYPE html>
 <html>

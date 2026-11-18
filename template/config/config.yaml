@@ -3,6 +3,12 @@
 # The sample sheet: one entry per sample, see config/samples.json.
 samples: config/samples.json
 
+# Settings of snakeplusplus itself: when a target finishes, it writes a diagram and a timeline
+# of its jobs into its result folder, e.g. results/everything/timeline.html.
+snakeplusplus:
+  diagram: true
+  timeline: true
+
 # Parameters per rule class: they override the defaults in the rule's ParamModel.
 params:
   Greet:

@@ -58,7 +58,8 @@ Output:
 9 texts/fox.txt
 ```
 
-[0:00:00] "count_words(CountWords)<name=fox>" completed in 0:00:00 (h:mm:ss).
+[0:00:00] Command finished in 0:00:00: exit code 0, peak memory 13 MB
+[0:00:00] "count_words(CountWords)<name=fox>" completed in 0:00:00 (h:mm:ss), peak memory 13 MB (commands), 101 MB (Python).
 
 Output mapping
 
@@ -75,9 +76,13 @@ Output mapping
 - **The header**: which job this is (variable name, class and wildcards), when it started, its
   result folder, and the parameters on line 4, for reading (Snakemake keeps its own record of
   them, to rerun the job when they change; see [When jobs rerun](reruns.md)).
-- **The body**: what `run()` did. `job.run()` writes each command and its output; `job.log()`
-  adds your own lines. Messages get the time since the job started; the output of commands is
-  written as it is.
+- **The body**: what `run()` did. `job.run()` and `job.shell()` write each command, its output,
+  and a line with its duration, exit code and peak memory; `job.log()` adds your own lines.
+  Messages get the time since the job started; the output of commands is written as it is.
+- **The last line**: how long the job took, and its peak memory: the highest of its commands,
+  and that of the job's own Python process, which includes Snakemake itself (about 100 MB).
+  The peak of a command includes the processes it starts; for a tool that runs several processes
+  side by side, it is that of the largest one, not their sum.
 - **Errors**, if any, under `Errors occurred`, with the lines of your own code where they
   happened (see [Where errors go](errors.md)).
 - **The output mapping**: the outputs of the job. File outputs are relative to the result folder;
