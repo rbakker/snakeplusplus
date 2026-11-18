@@ -1,0 +1,7 @@
+# Default command line options, used by every snakemake command in this pipeline.
+cores: all
+# use-conda: true                 # for rules with conda_env
+# on a cluster, e.g. with the slurm executor plugin:
+# executor: slurm
+# jobs: 100
+# default-resources: [mem_mb=4000, runtime=60]

@@ -14,3 +14,5 @@ examples/**/cache/
 # code update zip files, not committed
 archive/
 site/
+# made by tools/docs_template_zip.py when the docs are built
+docs/snakeplusplus-template.zip

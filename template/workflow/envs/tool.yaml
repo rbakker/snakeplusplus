@@ -1,0 +1,6 @@
+# An example conda environment, for a rule with conda_env = 'envs/tool.yaml'
+# (paths of conda environments are relative to the workflow folder).
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12

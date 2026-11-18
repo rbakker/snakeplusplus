@@ -1,0 +1,10 @@
+# made by the pipeline
+results/
+logs/
+.snakemake/
+*-diagram.html
+# reference data: often large, and not made by the pipeline
+resources/*
+!resources/README.md
+# Python
+__pycache__/

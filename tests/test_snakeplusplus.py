@@ -2355,3 +2355,22 @@ def test_reading_the_output_mapping_of_a_log(tmp_path, block):
             assert found is None
         else:
             assert json.loads(found) == json.loads(mapping), (name, found)
+
+
+def test_pipeline_template(tmp_path):
+    # the template that the website offers for download: it runs, from inside and from outside
+    import importlib.util, zipfile
+    spec = importlib.util.spec_from_file_location('docs_template_zip', HERE.parent / 'tools/docs_template_zip.py')
+    hook = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hook)
+    with zipfile.ZipFile(hook.make_zip(tmp_path / 'template.zip')) as z:
+        names = z.namelist()
+        assert {'my-pipeline/AGENTS.md', 'my-pipeline/workflow/rules/__init__.py', 'my-pipeline/workflow/scripts/__init__.py',
+                'my-pipeline/config/samples.json', 'my-pipeline/results/', 'my-pipeline/logs/'} <= set(names)
+        z.extractall(tmp_path)
+    folder = tmp_path / 'my-pipeline'
+    p = subprocess.run([sys.executable, '-m', 'snakemake', '-s', str(folder / 'workflow/Snakefile')],
+                       capture_output=True, text=True, cwd=tmp_path)   # started outside the pipeline folder
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert (folder / 'results/sample-world/greet/greeting.txt').read_text() == 'Hello, world!\n'
+    assert (folder / 'logs/sample-snakemake_greet.log').exists()

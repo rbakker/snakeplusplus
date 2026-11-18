@@ -1,0 +1,9 @@
+# Settings for one run of the pipeline. Change them here, not in the code.
+
+# The sample sheet: one entry per sample, see config/samples.json.
+samples: config/samples.json
+
+# Parameters per rule class: they override the defaults in the rule's ParamModel.
+params:
+  Greet:
+    greeting: Hello

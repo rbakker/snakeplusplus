@@ -52,6 +52,7 @@ plugins:
 nav:
   - Home: index.md
   - Tutorial: getting-started.md
+  - Start a new pipeline: new-pipeline.md
   - Concepts:
       - Rules: concepts/rules.md
       - Connecting rules: concepts/connecting.md
@@ -73,3 +74,6 @@ nav:
   - Comparison with other tools: comparison.md
   - Limitations: limitations.md
   - Reference: reference.md
+
+hooks:
+  - tools/docs_template_zip.py

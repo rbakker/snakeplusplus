@@ -1,0 +1,25 @@
+# The pipeline: which rules, how they are connected, and the targets.
+# The rule classes are in workflow/rules/; see AGENTS.md for the conventions.
+import json
+from pathlib import Path
+
+import snakeplusplus
+from snakeplusplus import target
+
+# all relative paths are relative to the pipeline folder, wherever snakemake is started
+workdir: str(Path(workflow.basedir).parent)
+configfile: 'config/config.yaml'
+
+# logs/ and results/ come from Snakemake's pathvars; add umask=0o002 to share the pipeline
+snakeplusplus.configure(workflow.pathvars, config.get('params'))
+
+RESOURCES = Path(workflow.pathvars.get('resources'))
+SAMPLES = json.loads(Path(config['samples']).read_text())
+
+from rules.hello import Greet
+
+greet = Greet()
+
+everything = target(greet.foreach(name=[s['name'] for s in SAMPLES]))
+
+snakeplusplus.build(locals())
