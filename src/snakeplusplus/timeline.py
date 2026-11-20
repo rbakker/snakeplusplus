@@ -13,6 +13,7 @@ import html
 import os
 import re
 import statistics
+import sys
 from datetime import datetime, timedelta
 from os import path as op
 
@@ -511,17 +512,24 @@ def main(argv=None):
         return
     import time
     print(f"Writing the timeline to {output} every {args.watch} seconds; stop with Ctrl-C")
+    # in a terminal, each update replaces the previous one; in a file, each gets its own line
+    same_line = sys.stdout.isatty()
     try:
         while True:
             totals = create_timeline(builder, target, output, refresh=args.watch)
-            print(f"{totals['now']:%H:%M:%S} {summary(totals)}", flush=True)
+            line = f"{totals['now']:%H:%M:%S} {summary(totals)}"
+            if same_line:
+                # a line that wraps could not be replaced as a whole
+                import shutil
+                line = line[:shutil.get_terminal_size().columns - 1]
+            print(f"\r\x1b[K{line}" if same_line else line, end='' if same_line else '\n', flush=True)
             if not totals['running'] and not totals['queued']:
                 break
             time.sleep(args.watch)
     except KeyboardInterrupt:
         pass
     totals = create_timeline(builder, target, output)  # the last one does not reload itself
-    print(f"Done: {summary(totals)}")
+    print(f"\r\x1b[KDone: {summary(totals)}" if same_line else f"Done: {summary(totals)}")
 
 
 if __name__ == '__main__':
