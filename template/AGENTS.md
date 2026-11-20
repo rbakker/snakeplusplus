@@ -107,4 +107,5 @@ the Snakefile and in `config/config.yaml`, the entries of `config/samples.json`,
 - Each target, when it finishes, writes `results/<target>/diagram.html` and
   `results/<target>/timeline.html`: the timeline shows which jobs failed, how long each job and
   command took, and their peak memory. `snakeplusplus-timeline -t <target>` writes it without
-  running anything.
+  running anything, also while the pipeline runs; with `--watch 60`, every minute, with an
+  estimate of the time left.

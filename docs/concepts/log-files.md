@@ -88,6 +88,39 @@ Output mapping
 - **The output mapping**: the outputs of the job. File outputs are relative to the result folder;
   values like `words` are stored as they are.
 
+## Following a run
+
+While Snakemake runs, the log folder shows where it is:
+
+```bash
+ls logs/*.running                            # what runs now
+ls logs/*.error                              # what failed so far
+ls logs | sed 's/.*\.//' | sort | uniq -c     # how many jobs in each state
+tail -f logs/sub-07_five_tt.running          # follow one job
+```
+
+`tail -f` shows each command when it starts and when it finishes; with
+`job.run(..., update_interval=60)`, also the output of a long command while it runs.
+
+For an overview, run the [timeline](targets.md#a-diagram-and-a-timeline) of the target, in a second
+terminal:
+
+```bash
+snakeplusplus-timeline --watch 60
+```
+
+```
+Writing the timeline to results/everything/timeline.html every 60 seconds; stop with Ctrl-C
+14:02:10 37 of 50 jobs succeeded, 2 failed, 4 running, 7 queued; about 1h 20m left
+```
+
+It writes the page again every minute, until no job of the target is running or queued, and the
+page reloads itself: open it in a browser, and it shows running jobs growing and failures as
+they happen. The time left is an estimate: each job that is running or queued takes the median
+duration of the finished jobs of its rule, spread over the jobs that run at the same time, but
+never less than the longest chain of jobs that still wait for each other. Jobs of a rule that
+has no finished job yet are not counted, and the page says how many there are.
+
 ## How the next job reads it
 
 The output mapping is how jobs pass on their results. When `word_report` runs, it reads the log

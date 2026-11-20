@@ -56,8 +56,10 @@ snakeplusplus:
 snakeplusplus.configure(workflow.pathvars, config.get('params'), options=config.get('snakeplusplus'))
 ```
 
-`snakeplusplus-timeline` writes the timeline of a target without running anything:
-`snakeplusplus-timeline -t test_run` writes `test_run-timeline.html` in the pipeline folder.
+`snakeplusplus-timeline` writes the timeline of a target without running anything, to the same
+place: `snakeplusplus-timeline -t test_run` writes `results/test_run/timeline.html`. It can be
+used at any time, also while the pipeline runs: see
+[Following a run](log-files.md#following-a-run).
 
 ## Names
 

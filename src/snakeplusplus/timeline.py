@@ -3,7 +3,7 @@ much memory they used, read from the log files.
 
     snakeplusplus-timeline                       # the default target, finds the Snakefile
     snakeplusplus-timeline -t everything         # another target
-    snakeplusplus-timeline -o timeline.html
+    snakeplusplus-timeline --watch 60            # again every minute, while the pipeline runs
 
 The page shows the jobs that a target depends on, whichever Snakemake runs made them: the same
 target gives the same totals, whether it was made in one run or in several. Nothing is run.
@@ -135,8 +135,13 @@ def target_jobs(builder, target):
     return jobs, upstream
 
 
-def collect(builder, target, exclude_target=False):
-    """The runs of the jobs of `target`, read from their log files, and the totals."""
+def collect(builder, target, exclude_target=False, now=None):
+    """The runs of the jobs of `target`, read from their log files, and the totals.
+
+    A running job lasts until `now`. A queued job's file still holds its previous run, which is
+    not shown: the job is listed as queued. For the jobs that are running or queued, the totals
+    have an estimate of the time left, from the median duration of the finished jobs per rule."""
+    now = now or datetime.now().replace(microsecond=0)
     jobs, upstream = target_jobs(builder, target)
     target_log = target.log_path({})
     runs, not_run = {}, []
@@ -145,11 +150,20 @@ def collect(builder, target, exclude_target=False):
             continue
         f = _state_file(log)
         job = read_log(f) if f else None
+        if job is None and f and f.endswith('.queued'):
+            # a job that has not run before: an empty file, made when the run started
+            job = dict(path=f, name=log, started=now, state='queued', duration=0, last=0, commands=[],
+                       peak_commands=None, peak_python=None, error=None, wildcards='', ended=now)
         if job is None:
             not_run.append(log)
         else:
             job['log'] = log
             job['rule'], job['cls'] = rule.name, type(rule).__name__
+            if not job['wildcards'] and wc:
+                job['wildcards'] = ','.join(f'{k}={v}' for k, v in wc.items())
+            if job['state'] == 'running':
+                job['duration'] = max(job['duration'], int((now - job['started']).total_seconds()))
+                job['ended'] = job['started'] + timedelta(seconds=job['duration'])
             runs[log] = job
 
     # the critical path: the longest chain of jobs that depend on each other, with the
@@ -168,14 +182,47 @@ def collect(builder, target, exclude_target=False):
     critical = [log for log in critical if log in runs]
 
     succeeded = [j for j in runs.values() if j['state'] == 'log']
+    count = lambda state: sum(j['state'] == state for j in runs.values())
     totals = dict(
-        jobs=len(jobs) - (1 if exclude_target else 0), succeeded=len(succeeded),
-        failed=sum(j['state'] == 'error' for j in runs.values()),
-        other=sum(j['state'] not in ('log', 'error') for j in runs.values()),
+        jobs=len(jobs) - (1 if exclude_target else 0), succeeded=len(succeeded), failed=count('error'),
+        running=count('running'), queued=count('queued'), stale=count('stale'),
         not_run=len(not_run), compute=sum(j['duration'] for j in succeeded), critical=critical_time,
         peak=max((j['peak_commands'] or 0 for j in runs.values()), default=0) or None,
+        now=now, target_state=(runs.get(target_log) or {}).get('state'),
     )
+    totals.update(_estimate(runs, upstream, jobs))
     return runs, totals, critical, not_run
+
+
+def _estimate(runs, upstream, jobs):
+    """The time left for the jobs that are running or queued: each takes the median duration of
+    the finished jobs of its rule (a running job, what is left of it); together they take their
+    sum divided over the jobs that run at the same time, but at least their longest chain."""
+    medians = {}
+    for j in runs.values():
+        if j['state'] == 'log':
+            medians.setdefault(j['rule'], []).append(j['duration'])
+    medians = {rule: statistics.median(d) for rule, d in medians.items()}
+    left, unknown = {}, 0
+    for log, j in runs.items():
+        if j['state'] in ('running', 'queued') and j.get('cls') != 'TargetRule':  # a target takes no time
+            if j['rule'] in medians:
+                elapsed = j['duration'] if j['state'] == 'running' else 0
+                left[log] = max(medians[j['rule']] - elapsed, 0)
+            else:
+                unknown += 1
+    if not left:
+        return dict(left=None, left_unknown=unknown)  # no estimate yet
+    chains = {}
+
+    def chain(log):
+        if log not in chains:
+            chains[log] = 0
+            chains[log] = left.get(log, 0) + max((chain(u) for u in upstream.get(log, []) if u in jobs), default=0)
+        return chains[log]
+    longest = max((chain(log) for log in jobs), default=0)
+    parallel = max(sum(j['state'] == 'running' for j in runs.values()), 1)
+    return dict(left=max(sum(left.values()) / parallel, longest), left_unknown=unknown)
 
 
 def _fmt_duration(seconds):
@@ -213,9 +260,11 @@ def _segments(runs, min_gap):
     return periods
 
 
-def render(runs, totals, critical, not_run, title, output_path):
-    """The timeline as an HTML page; links to the log files are relative to `output_path`."""
-    jobs = sorted(runs.values(), key=lambda j: (j['started'], j['name']))
+def render(runs, totals, critical, not_run, title, output_path, refresh=None):
+    """The timeline as an HTML page; links to the log files are relative to `output_path`. With
+    `refresh`, the page reloads itself every so many seconds."""
+    queued = sorted((j for j in runs.values() if j['state'] == 'queued'), key=lambda j: j['name'])
+    jobs = sorted((j for j in runs.values() if j['state'] != 'queued'), key=lambda j: (j['started'], j['name']))
     critical = set(critical)
     folder = op.dirname(op.abspath(output_path))
 
@@ -236,7 +285,7 @@ def render(runs, totals, critical, not_run, title, output_path):
 
     colors = {'log': '#4c8bd6', 'error': '#d64c4c', 'stale': '#b0a040', 'running': '#60b060', 'queued': '#aaaaaa'}
     rows = []
-    height = 40 + ROW * len(jobs)
+    height = 40 + ROW * (len(jobs) + len(queued))
     # axis: a tick per busy period start, and per hour inside it
     axis = []
     for i, (s, e) in enumerate(periods):
@@ -262,6 +311,8 @@ def render(runs, totals, critical, not_run, title, output_path):
         href = _esc(op.relpath(j['path'], folder))
         label = j['rule'] + (f" ({j['wildcards']})" if j['wildcards'] else '')
         state = {'log': 'succeeded', 'error': 'failed', 'stale': 'interrupted'}.get(j['state'], j['state'])
+        if j['state'] == 'running':
+            state = 'running, since'
         tip = [f"{label}: {state}", f"started {j['started']:%Y-%m-%d %H:%M:%S}, {_fmt_duration(j['duration'])}"]
         if j['peak_commands']:
             tip.append(f"peak memory {_fmt_memory(j['peak_commands'])}")
@@ -283,8 +334,17 @@ def render(runs, totals, critical, not_run, title, output_path):
             parts.append(f'<rect x="{cx0:.1f}" y="{y + 5}" width="{max(cx1 - cx0, 1):.1f}" height="{ROW - 10}" '
                          f'class="cmd c{k % 2}"><title>{_esc(chr(10).join(ctip))}</title></rect>')
         text = _fmt_duration(j['duration']) + (f" / {_fmt_memory(j['peak_commands'])}" if j['peak_commands'] else '')
+        if j['state'] == 'running':
+            text = 'running ' + text
         parts.append(f'<text x="{x1 + 4:.1f}" y="{y + 12}" class="info">{_esc(text)}</text>')
         rows.append(''.join(parts))
+    # queued jobs: waiting for their turn, after the others
+    xq = x(totals['now']) if periods else LABEL
+    for n, j in enumerate(queued, len(jobs)):
+        y = 40 + n * ROW
+        label = j['rule'] + (f" ({j['wildcards']})" if j['wildcards'] else '')
+        rows.append(f'<text x="{LABEL - 8}" y="{y + 12}" class="label queued" text-anchor="end">{_esc(label)}</text>'
+                    f'<text x="{xq + 4:.1f}" y="{y + 12}" class="info">queued</text>')
 
     svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {LABEL + WIDTH + 160} {height + 10}" '
            f'width="100%" style="min-width: 1000px">'
@@ -295,12 +355,16 @@ def render(runs, totals, critical, not_run, title, output_path):
     for j in jobs:
         by_rule.setdefault((j['rule'], j['cls']), []).append(j)
     table = []
-    for (rule, cls), js in sorted(by_rule.items(), key=lambda kv: -sum(j['duration'] for j in kv[1])):
+    for j in queued:
+        by_rule.setdefault((j['rule'], j['cls']), []).append(j)
+    for (rule, cls), js in sorted(by_rule.items(), key=lambda kv: -sum(j['duration'] for j in kv[1] if j['state'] == 'log')):
         ok = [j for j in js if j['state'] == 'log']
+        n = lambda state: sum(j['state'] == state for j in js) or ''
         durations = [j['duration'] for j in ok]
         memories = [j['peak_commands'] for j in ok if j['peak_commands']]
         table.append(
-            f"<tr><td>{_esc(rule)}</td><td>{_esc(cls)}</td><td>{len(js)}</td><td>{len(js) - len(ok) or ''}</td>"
+            f"<tr><td>{_esc(rule)}</td><td>{_esc(cls)}</td><td>{len(js)}</td><td>{len(ok) or ''}</td>"
+            f"<td>{n('error')}</td><td>{n('running')}</td><td>{n('queued')}</td>"
             f"<td>{_fmt_duration(statistics.median(durations)) if durations else ''}</td>"
             f"<td>{_fmt_duration(max(durations)) if durations else ''}</td>"
             f"<td>{_fmt_duration(sum(durations)) if durations else ''}</td>"
@@ -308,15 +372,24 @@ def render(runs, totals, critical, not_run, title, output_path):
             f"<td>{_fmt_memory(max(memories)) if memories else ''}</td></tr>")
 
     missing = []
-    if totals['failed'] or totals['other'] or totals['not_run']:
-        missing.append(f"The totals count the {totals['succeeded']} jobs that succeeded; "
-                       f"{totals['failed']} failed, {totals['other']} were interrupted or are queued or running, "
-                       f"and {totals['not_run']} have not run.")
+    states = [(totals['failed'], 'failed'), (totals['running'], 'running'), (totals['queued'], 'queued'),
+              (totals['stale'], 'interrupted'), (totals['not_run'], 'not run yet')]
+    others = ', '.join(f'{n} {what}' for n, what in states if n)
+    if others:
+        missing.append(f"The totals count the {totals['succeeded']} jobs that succeeded; {others}.")
+    left = ''
+    if totals['left'] is not None or totals['left_unknown']:
+        known = f"about {_fmt_duration(totals['left'])}" if totals['left'] is not None else 'not known yet'
+        left = (f"<tr><td>time left (estimate)</td><td>{known}"
+                + (f", not counting {totals['left_unknown']} job{'s' if totals['left_unknown'] > 1 else ''} "
+                   f"of rules that have no finished job yet"
+                   if totals['left_unknown'] else '') + '</td></tr>')
     span = (max(j['ended'] for j in jobs) - min(j['started'] for j in jobs)).total_seconds() if jobs else 0
     page = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8"/>
+{f'<meta http-equiv="refresh" content="{refresh}"/>' if refresh else ''}
 <title>{_esc(title)}</title>
 <style>
 body {{ font-family: sans-serif; margin: 40px; color: #333; }}
@@ -335,13 +408,17 @@ a .label:hover {{ fill: #0645ad; text-decoration: underline; }}
 .job.critical {{ stroke: #000; stroke-width: 1.5; }}
 .cmd.c0 {{ fill: rgba(255,255,255,0.35); }}
 .cmd.c1 {{ fill: rgba(0,0,0,0.15); }}
+.updated {{ color: #666; }}
+.label.queued {{ fill: #999; }}
 .legend span {{ display: inline-block; width: 12px; height: 12px; margin: 0 4px 0 14px; vertical-align: middle; }}
 </style>
 </head>
 <body>
 <h1>{_esc(title)}</h1>
+<p class="updated">{f"Updated every {refresh} seconds; " if refresh else ''}as of {totals['now']:%Y-%m-%d %H:%M:%S}.</p>
 <table class="totals">
 <tr><td>jobs</td><td>{totals['jobs']}</td></tr>
+{left}
 <tr><td>compute time (sum of the jobs)</td><td>{_fmt_duration(totals['compute'])}</td></tr>
 <tr><td>critical path (with enough cores)</td><td>{_fmt_duration(totals['critical'])}</td></tr>
 <tr><td>from first start to last end</td><td>{_fmt_duration(span)}{' (with the gaps between runs)' if len(periods) > 1 else ''}</td></tr>
@@ -349,12 +426,12 @@ a .label:hover {{ fill: #0645ad; text-decoration: underline; }}
 </table>
 <p>{_esc(' '.join(missing))}</p>
 <p class="legend"><span style="background:#4c8bd6"></span>succeeded<span style="background:#d64c4c"></span>failed
-<span style="background:#b0a040"></span>interrupted<span style="border:1.5px solid #000"></span>on the critical path.
+<span style="background:#b0a040"></span>interrupted<span style="background:#60b060"></span>running<span style="border:1.5px solid #000"></span>on the critical path.
 Bars show the commands of a job; hover over them for details, click a job's name for its log file.</p>
 <div class="timeline">{svg}</div>
 <h2>Per rule</h2>
 <table>
-<tr><th>rule</th><th>class</th><th>jobs</th><th>failed</th><th>median time</th><th>max time</th><th>total time</th>
+<tr><th>rule</th><th>class</th><th>jobs</th><th>succeeded</th><th>failed</th><th>running</th><th>queued</th><th>median time</th><th>max time</th><th>total time</th>
 <th>median memory</th><th>max memory</th></tr>
 {''.join(table)}
 </table>
@@ -367,10 +444,24 @@ Bars show the commands of a job; hover over them for details, click a job's name
     return output_path
 
 
-def create_timeline(builder, target, output_path, title=None, exclude_target=False):
-    """Write the timeline of the jobs that `target` depends on to `output_path`."""
+def create_timeline(builder, target, output_path, title=None, exclude_target=False, refresh=None):
+    """Write the timeline of the jobs that `target` depends on to `output_path`; returns the totals."""
     runs, totals, critical, not_run = collect(builder, target, exclude_target)
-    return render(runs, totals, critical, not_run, title or f'Timeline of {target.name}', output_path)
+    render(runs, totals, critical, not_run, title or f'Timeline of {target.name}', output_path, refresh)
+    return totals
+
+
+def summary(totals):
+    """One line: '37 of 50 jobs succeeded, 2 failed, 4 running, 7 queued; about 1h 20m left'."""
+    parts = [f"{totals['succeeded']} of {totals['jobs']} jobs succeeded"]
+    parts += [f"{totals[k]} {what}" for k, what in [('failed', 'failed'), ('running', 'running'),
+                                                    ('queued', 'queued'), ('stale', 'interrupted')] if totals[k]]
+    text = ', '.join(parts)
+    if totals['left'] is not None:
+        text += f"; about {_fmt_duration(totals['left'])} left"
+    elif totals['left_unknown']:
+        text += "; time left not known yet"
+    return text
 
 
 def default_target(builder):
@@ -386,7 +477,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('snakefile', nargs='?', help='default: Snakefile or workflow/Snakefile, like Snakemake')
     parser.add_argument('-t', '--target', help='default: the default target of the pipeline')
-    parser.add_argument('-o', '--output', help='default: <target>-timeline.html in the pipeline folder')
+    parser.add_argument('-o', '--output', help="default: timeline.html in the target's result folder, "
+                                                "where the target writes it when it finishes")
+    parser.add_argument('-w', '--watch', type=int, metavar='SECONDS',
+                        help='write the timeline again every so many seconds, until no job of the target '
+                             'is running or queued; the page reloads itself')
     parser.add_argument('--config', nargs='*', metavar='KEY=VALUE', help='same as snakemake --config')
     parser.add_argument('--configfile', nargs='*', help='same as snakemake --configfile')
     parser.add_argument('--directory', help='working directory, same as snakemake --directory')
@@ -409,9 +504,24 @@ def main(argv=None):
                          + ', '.join(n for n, r in builder.rules.items() if not r._wildcard_names()))
     else:
         target = default_target(builder)
-    output = given or op.join(folder, f'{target.name}-timeline.html')
-    create_timeline(builder, target, output)
-    print(f"Timeline written to: {output}")
+    output = given or op.abspath(op.join(target.result_path({}), 'timeline.html'))
+    if not args.watch:
+        totals = create_timeline(builder, target, output)
+        print(f"Timeline written to: {output}\n{summary(totals)}")
+        return
+    import time
+    print(f"Writing the timeline to {output} every {args.watch} seconds; stop with Ctrl-C")
+    try:
+        while True:
+            totals = create_timeline(builder, target, output, refresh=args.watch)
+            print(f"{totals['now']:%H:%M:%S} {summary(totals)}", flush=True)
+            if not totals['running'] and not totals['queued']:
+                break
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        pass
+    totals = create_timeline(builder, target, output)  # the last one does not reload itself
+    print(f"Done: {summary(totals)}")
 
 
 if __name__ == '__main__':

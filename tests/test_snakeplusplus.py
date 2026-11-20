@@ -5,6 +5,7 @@
 import json
 import os
 import subprocess
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -2481,3 +2482,61 @@ def test_timeline_of_a_target(tmp_path):
                         '-t', 'test_run', '-o', str(tmp_path / 'tl.html')], capture_output=True, text=True)
     assert p.returncode == 0, p.stdout + p.stderr
     assert 'Timeline of test_run' in (tmp_path / 'tl.html').read_text()
+
+
+SLOW_SNAKEFILE = """
+import time
+from pathlib import Path
+import snakeplusplus
+from snakeplusplus import SnakeRule, target, Field
+snakeplusplus.configure(dict(logs='logs', results='results'))
+
+class Slow(SnakeRule):
+    result_template = 'n-{n}'
+    class OutputModel:
+        done: Path = Field('done.txt')
+    def run(self, job, input, output, params, wildcards):
+        job.run(['sleep', '3'])
+        output.done.write_text('done')
+
+class Broken(SnakeRule):
+    class OutputModel:
+        done: Path = Field('done.txt')
+    def run(self, job, input, output, params, wildcards):
+        raise ValueError('broken')
+
+slow = Slow()
+broken = Broken()
+everything = target(slow.foreach(n=['1', '2', '3', '4']), broken)
+snakeplusplus.build(locals())
+"""
+
+
+def test_timeline_while_running(tmp_path):
+    # running and queued jobs are not failures; the page goes where the target writes it
+    import time
+    (tmp_path / 'Snakefile').write_text(SLOW_SNAKEFILE)
+    run = subprocess.Popen([sys.executable, '-m', 'snakemake', '-c1'], cwd=tmp_path,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        logs = tmp_path / 'logs'
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            names = [f.name for f in logs.iterdir()] if logs.exists() else []
+            if any(n.endswith('.running') for n in names) and any(n.endswith('_slow.log') for n in names):
+                break
+            time.sleep(0.5)
+        p = subprocess.run([sys.executable, '-m', 'snakeplusplus.timeline'], cwd=tmp_path,
+                           capture_output=True, text=True)
+        assert p.returncode == 0, p.stdout + p.stderr
+        page = (tmp_path / 'results/everything/timeline.html').read_text()
+        line = p.stdout.splitlines()[-1]
+        assert 'running' in line and 'queued' in line, line
+        failed = int(re.search(r'(\d+) failed', line).group(1)) if 'failed' in line else 0
+        assert failed <= 1                      # only broken can have failed
+        assert 'left' in line and 'time left (estimate)' in page
+        assert '>queued</text>' in page
+    finally:
+        run.wait(timeout=180)
+    p = subprocess.run([sys.executable, '-m', 'snakeplusplus.timeline'], cwd=tmp_path, capture_output=True, text=True)
+    assert p.stdout.splitlines()[-1] == '4 of 6 jobs succeeded, 2 failed'   # broken, and the target
